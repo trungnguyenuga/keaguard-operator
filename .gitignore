@@ -1,0 +1,36 @@
+# Environment variables, local secrets, and private keys
+.env
+.env.*
+!.env.example
+/secrets/
+*.pem
+*.key
+*.crt
+*.p12
+
+# Go build artifacts and coverage
+/bin/
+/dist/
+/coverage/
+coverage.out
+*.test
+*.out
+*.exe
+
+# Local Kubernetes and development state
+.kube/
+.kind/
+.terraform/
+*.tfstate
+*.tfstate.*
+
+# Local scratch and test output
+/tmp/
+/.local/
+
+# IDE and operating system files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+Desktop.ini
