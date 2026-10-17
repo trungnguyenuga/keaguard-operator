@@ -7,6 +7,9 @@
 *.key
 *.crt
 *.p12
+*.kubeconfig
+*.kubeconfig.yaml
+*.token
 
 # Go build artifacts and coverage
 /bin/
@@ -27,6 +30,10 @@ coverage.out
 # Local scratch and test output
 /tmp/
 /.local/
+/.cache/
+/.docker-config/
+/docker-config/
+/kind-config/
 
 # IDE and operating system files
 .idea/

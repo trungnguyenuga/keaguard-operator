@@ -1,0 +1,6 @@
+# Privileged installer composition, independent of the runtime bundle.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+- bases/infrastructure.keaguard.example_keaclusters.yaml
+# +kubebuilder:scaffold:crdkustomizeresource

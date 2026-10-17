@@ -1,5 +1,7 @@
 # KeaGuard
 
-KeaGuard is a planned Go/Kubebuilder Kubernetes Operator for Kea DHCP High Availability.
+KeaGuard M1 is a Kubernetes controller foundation for reconciling a namespaced `KeaCluster` resource into an internal ConfigMap artifact. Its `spec` is intentionally empty. The ConfigMap records the parent name, namespace, and UID; it is not Kea configuration.
 
-The project is not implemented yet. Design and implementation work will be added in later commits.
+`ArtifactReconciled` reports whether that internal artifact matches the controller's ownership and managed-field contract. It does not report Kea process health, DHCP service, lease synchronization, or failover readiness. M1 does not deploy or configure Kea and makes no DHCP, HA, availability, latency, or performance claims.
+
+See [M1 development and local acceptance](docs/development/m1.md) for pinned tools, separate CRD/runtime installation, tests, safe opt-in Kind selection, and the limits of the current milestone.

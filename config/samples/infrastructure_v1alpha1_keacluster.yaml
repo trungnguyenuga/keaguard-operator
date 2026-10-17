@@ -1,0 +1,5 @@
+apiVersion: infrastructure.keaguard.example/v1alpha1
+kind: KeaCluster
+metadata:
+  name: keacluster-sample
+  namespace: keaguard-system

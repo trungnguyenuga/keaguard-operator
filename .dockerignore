@@ -1,0 +1,14 @@
+# Only the production package roots and verified module manifests enter context.
+# Private docs, Git metadata, credentials, local caches and tests stay excluded.
+**
+!go.mod
+!go.sum
+!api/
+!api/v1alpha1/
+!api/v1alpha1/*.go
+!cmd/
+!cmd/*.go
+!internal/
+!internal/controller/
+!internal/controller/*.go
+**/*_test.go

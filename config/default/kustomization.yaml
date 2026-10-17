@@ -1,0 +1,12 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: keaguard-system
+namePrefix: keaguard-
+resources:
+- ../rbac
+- ../manager
+# Derive the flag from this composition's rendered Deployment namespace.
+# Namespace-changing outer overlays must also apply namespace_replacement.yaml
+# at their own level (copy it beneath the overlay root; retain load restrictions).
+replacements:
+- path: namespace_replacement.yaml
