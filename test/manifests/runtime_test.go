@@ -227,20 +227,35 @@ func TestUnitRuntimeManifestContract(t *testing.T) {
 			}
 			permissions := map[string][]string{}
 			for _, rule := range role.Rules {
-				if len(rule.ResourceNames) > 0 || len(rule.NonResourceURLs) > 0 || len(rule.APIGroups) != 1 || len(rule.Resources) != 1 {
+				if len(rule.ResourceNames) > 0 || len(rule.NonResourceURLs) > 0 || len(rule.APIGroups) != 1 || len(rule.Resources) == 0 || len(rule.Verbs) == 0 {
 					t.Errorf("unexpected RBAC rule shape: %+v", rule)
 					continue
 				}
-				key := rule.APIGroups[0] + "/" + rule.Resources[0]
-				if _, exists := permissions[key]; exists {
-					t.Errorf("duplicate RBAC rule: %s", key)
+				group := rule.APIGroups[0]
+				if strings.Contains(group, "*") {
+					t.Errorf("wildcard API group is forbidden: %+v", rule)
 				}
 				verbs := append([]string(nil), rule.Verbs...)
 				sort.Strings(verbs)
-				permissions[key] = verbs
+				if containsDuplicate(verbs) || containsWildcard(verbs) {
+					t.Errorf("duplicate or wildcard verb in RBAC rule: %+v", rule)
+				}
+				for _, resource := range rule.Resources {
+					key := group + "/" + resource
+					if resource == "*" || strings.Contains(resource, "*") {
+						t.Errorf("wildcard resource is forbidden: %s", key)
+					}
+					if _, exists := permissions[key]; exists {
+						t.Errorf("duplicate RBAC grant key: %s", key)
+					}
+					permissions[key] = append([]string(nil), verbs...)
+				}
 			}
 			wantPermissions := map[string][]string{
-				"/configmaps": {"create", "get", "list", "patch", "watch"},
+				"/configmaps":       {"create", "delete", "get", "list", "patch", "watch"},
+				"/pods":             {"get", "list", "watch"},
+				"/services":         {"create", "delete", "get", "list", "patch", "watch"},
+				"apps/statefulsets": {"create", "delete", "get", "list", "patch", "watch"},
 				"infrastructure.keaguard.example/keaclusters":        {"get", "list", "watch"},
 				"infrastructure.keaguard.example/keaclusters/status": {"patch"},
 			}
@@ -306,4 +321,22 @@ func TestUnitRuntimeManifestContract(t *testing.T) {
 	if len(crd.Spec.Versions) != 1 || crd.Spec.Versions[0].Name != "v1alpha1" || !crd.Spec.Versions[0].Served || !crd.Spec.Versions[0].Storage || crd.Spec.Versions[0].Subresources == nil || crd.Spec.Versions[0].Subresources.Status == nil {
 		t.Error("incorrect version/status API contract")
 	}
+}
+
+func containsDuplicate(values []string) bool {
+	for i := 1; i < len(values); i++ {
+		if values[i] == values[i-1] {
+			return true
+		}
+	}
+	return false
+}
+
+func containsWildcard(values []string) bool {
+	for _, value := range values {
+		if value == "*" || strings.Contains(value, "*") {
+			return true
+		}
+	}
+	return false
 }

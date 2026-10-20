@@ -105,7 +105,7 @@ var _ = Describe("ENV: API", func() {
 		}
 	})
 
-	It("publishes only the minimal structural API and list-map conditions", func() {
+	It("publishes the optional workload API and list-map conditions", func() {
 		ac, err := apiextensionsclient.NewForConfig(cfg)
 		Expect(err).NotTo(HaveOccurred())
 		crd, err := ac.ApiextensionsV1().CustomResourceDefinitions().Get(requestCtx, "keaclusters.infrastructure.keaguard.example", metav1.GetOptions{})
@@ -126,7 +126,17 @@ var _ = Describe("ENV: API", func() {
 		Expect(root.Properties).To(HaveKey("spec"))
 		spec := root.Properties["spec"]
 		Expect(spec.Type).To(Equal("object"))
-		Expect(spec.Properties).To(BeEmpty())
+		Expect(spec.Properties).To(HaveLen(1))
+		Expect(spec.Properties).To(HaveKey("workload"))
+		workload := spec.Properties["workload"]
+		Expect(workload.Type).To(Equal("object"))
+		Expect(workload.Required).To(BeEmpty())
+		Expect(workload.Properties).To(HaveLen(2))
+		Expect(workload.Properties["enabled"].Type).To(Equal("boolean"))
+		Expect(workload.Properties["loggingSeverity"].Type).To(Equal("string"))
+		Expect(workload.Properties["loggingSeverity"].Enum).To(HaveLen(6))
+		Expect(workload.Properties["enabled"].Default).To(BeNil())
+		Expect(workload.Properties["loggingSeverity"].Default).To(BeNil())
 		status := root.Properties["status"]
 		Expect(status.Properties).To(HaveLen(2))
 		Expect(status.Properties).To(HaveKey("observedGeneration"))
@@ -413,8 +423,8 @@ var _ = Describe("ENV: Core", func() {
 	It("creates exact admitted artifacts independently, preserves no-op status, and recreates a removed artifact", func() {
 		first := makeParent("first", false)
 		second := makeParent("second", true)
-		Expect(reconcile(first).RequeueAfter).To(Equal(5 * time.Minute))
-		Expect(reconcile(second).RequeueAfter).To(Equal(5 * time.Minute))
+		Expect(reconcile(first).RequeueAfter).To(Equal(time.Second))
+		Expect(reconcile(second).RequeueAfter).To(Equal(time.Second))
 		old := check(first)
 		secondCM := check(second)
 		Expect(c.creates).To(Equal(2))
@@ -434,7 +444,7 @@ var _ = Describe("ENV: Core", func() {
 		Expect(k8sClient.Get(requestCtx, client.ObjectKeyFromObject(first), after)).To(Succeed())
 		Expect(after.Status).To(Equal(before.Status))
 		Expect(k8sClient.Delete(requestCtx, old)).To(Succeed())
-		Expect(reconcile(first).RequeueAfter).To(Equal(5 * time.Minute))
+		Expect(reconcile(first).RequeueAfter).To(Equal(time.Second))
 		replacement := check(first)
 		Expect(replacement.UID).NotTo(Equal(old.UID))
 		Expect(check(second).UID).To(Equal(secondCM.UID))
@@ -581,7 +591,7 @@ var _ = Describe("ENV: Managed state", func() {
 		cm.OwnerReferences = append(cm.OwnerReferences, metav1.OwnerReference{APIVersion: "v1", Kind: "ConfigMap", Name: "other", UID: "extra-owner", Controller: boolPointer(false)})
 		Expect(k8sClient.Create(requestCtx, cm)).To(Succeed())
 		before := cm.DeepCopy()
-		reconcile("ArtifactInSync", 5*time.Minute)
+		reconcile("ArtifactInSync", time.Second)
 		Expect(c.artifactPatches).To(Equal(1))
 		Expect(c.otherWrites()).To(Equal(1))
 		Expect(c.patchRV).To(Equal(before.ResourceVersion))
@@ -617,7 +627,7 @@ var _ = Describe("ENV: Managed state", func() {
 			checkBlocked(cm.DeepCopy(), "ImmutableArtifact")
 			oldUID := cm.UID
 			Expect(k8sClient.Delete(requestCtx, cm)).To(Succeed())
-			reconcile("ArtifactInSync", 5*time.Minute)
+			reconcile("ArtifactInSync", time.Second)
 			Expect(c.otherWrites()).To(Equal(1))
 			Expect(c.artifactPatches).To(BeZero())
 			Expect(k8sClient.Get(requestCtx, key, cm)).To(Succeed())
@@ -639,7 +649,7 @@ var _ = Describe("ENV: Managed state", func() {
 		oldUID := cm.UID
 		cm.Finalizers = nil
 		Expect(k8sClient.Update(requestCtx, cm)).To(Succeed())
-		reconcile("ArtifactInSync", 5*time.Minute)
+		reconcile("ArtifactInSync", time.Second)
 		Expect(c.otherWrites()).To(Equal(1))
 		Expect(k8sClient.Get(requestCtx, key, cm)).To(Succeed())
 		Expect(cm.UID).NotTo(Equal(oldUID))

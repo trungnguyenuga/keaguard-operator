@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -61,6 +62,12 @@ func t14GetManagerPod(ctx context.Context) *corev1.Pod {
 }
 
 func t14SetManagerSpec(ctx context.Context, spec appsv1.DeploymentSpec) error {
+	if selectedProfile.milestone == "m2" {
+		if m2ActiveScenario == nil || m2ActiveScenario.Manager == nil || !reflect.DeepEqual(spec, m2ActiveScenario.Manager.Spec) {
+			return fmt.Errorf("M2 manager repair requires the recorded original spec")
+		}
+		return m2RestoreManager(ctx, m2ActiveScenario.Manager)
+	}
 	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		current := &appsv1.Deployment{}
 		if err := admin.Get(ctx, client.ObjectKey{Namespace: runtimeNamespace, Name: managerName}, current); err != nil {
@@ -73,6 +80,12 @@ func t14SetManagerSpec(ctx context.Context, spec appsv1.DeploymentSpec) error {
 }
 
 func t14ScaleManager(ctx context.Context, replicas int32) error {
+	if selectedProfile.milestone == "m2" {
+		if m2ActiveScenario == nil {
+			return fmt.Errorf("M2 manager mutation lacks a scenario")
+		}
+		return m2PatchManagerSpec(ctx, m2ActiveScenario.Manager, func(spec *appsv1.DeploymentSpec) { spec.Replicas = &replicas })
+	}
 	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		current := &appsv1.Deployment{}
 		if err := admin.Get(ctx, client.ObjectKey{Namespace: runtimeNamespace, Name: managerName}, current); err != nil {
@@ -95,6 +108,13 @@ func t14WaitStopped(ctx context.Context) {
 }
 
 func t14WaitReady(ctx context.Context) {
+	if selectedProfile.milestone == "m2" {
+		if m2ActiveScenario == nil {
+			Fail("M2 manager readiness lacks a scenario")
+		}
+		Expect(m2WaitManagerHealthy(ctx, m2ActiveScenario.ExpectedImage, m2ActiveScenario.ExpectedImageID, m2VerifyManagerDeployment)).To(Succeed())
+		return
+	}
 	out, err := kubectl(ctx, "rollout", "status", "deployment/"+managerName, "-n", runtimeNamespace, "--timeout=110s")
 	Expect(err).NotTo(HaveOccurred(), "%s", out)
 	Eventually(func() bool {
@@ -109,6 +129,9 @@ func t14WaitReady(ctx context.Context) {
 }
 
 func t14RestoreManager(original *appsv1.Deployment) {
+	if selectedProfile.milestone == "m2" {
+		Fail("legacy Background-based manager restoration is forbidden under M2")
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Second)
 	defer cancel()
 	Expect(t14SetManagerSpec(ctx, original.Spec)).To(Succeed())
@@ -147,6 +170,13 @@ func t14WaitParentGone(key client.ObjectKey, oldUID types.UID) {
 		}
 		return current.UID != oldUID, nil
 	}, 120*time.Second, time.Second).Should(BeTrue())
+	if selectedProfile.milestone == "m2" {
+		if m2ActiveScenario == nil {
+			Fail("M2 parent disappearance lacks a scenario ledger")
+		}
+		identity := m2FixtureIdentity{Key: key, GVK: infrastructurev1alpha1.GroupVersion.WithKind("KeaCluster"), UID: oldUID}
+		Expect(m2ActiveScenario.VerifyAbsent(labctx, identity)).To(Succeed())
+	}
 }
 
 // A same-name replacement counts as disappearance of the recorded old child UID.
@@ -165,11 +195,18 @@ func t14WaitUIDGone(key client.ObjectKey, oldUID types.UID) {
 }
 
 func t14DeleteParent(p *infrastructurev1alpha1.KeaCluster, options ...client.DeleteOption) {
-	Expect(admin.Delete(labctx, p, append(options, client.Preconditions{UID: &p.UID})...)).To(Succeed())
+	Expect(m2DeleteObject(labctx, p, append(options, client.Preconditions{UID: &p.UID})...)).To(Succeed())
 	t14WaitParentGone(client.ObjectKeyFromObject(p), p.UID)
 }
 
 func t14RestoreRoleRules(original *rbacv1.Role) {
+	if selectedProfile.milestone == "m2" {
+		if m2ActiveScenario == nil || m2ActiveScenario.Role == nil || original.UID != m2ActiveScenario.Role.UID {
+			Fail("M2 Role repair lacks the recorded original UID")
+		}
+		Expect(m2RestoreRole(labctx, m2ActiveScenario.Role)).To(Succeed())
+		return
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	Expect(retry.RetryOnConflict(retry.DefaultRetry, func() error {
@@ -208,6 +245,12 @@ func t14RemoveStatusPatch(ctx context.Context) *rbacv1.Role {
 		}
 		base := current.DeepCopy()
 		current.Rules = rules
+		if selectedProfile.milestone == "m2" {
+			if m2ActiveScenario == nil || m2ActiveScenario.Role == nil || current.UID != m2ActiveScenario.Role.UID {
+				return fmt.Errorf("M2 status-rule fault lacks original Role UID")
+			}
+			return admin.Patch(ctx, current, client.MergeFromWithOptions(base, client.MergeFromWithOptimisticLock{}))
+		}
 		return admin.Patch(ctx, current, client.MergeFrom(base))
 	})).To(Succeed())
 	return original
@@ -216,11 +259,29 @@ func t14RemoveStatusPatch(ctx context.Context) *rbacv1.Role {
 func t14AddHoldFinalizer(cm *corev1.ConfigMap) *corev1.ConfigMap {
 	base := cm.DeepCopy()
 	cm.Finalizers = append(cm.Finalizers, t14HoldFinalizer)
-	Expect(admin.Update(labctx, cm)).To(Succeed())
+	Expect(m2UpdateObject(labctx, cm, "absent")).To(Succeed())
 	return base
 }
 
 func t14ReleaseHoldFinalizer(key client.ObjectKey, uid types.UID) {
+	if selectedProfile.milestone == "m2" {
+		Expect(m2ActiveScenario).NotTo(BeNil())
+		identity := m2FixtureIdentity{Key: key, GVK: corev1.SchemeGroupVersion.WithKind("ConfigMap"), UID: uid}
+		fixture, recorded := m2ActiveScenario.ledger.fixtures[fixtureKey(identity)]
+		Expect(recorded && slices.Contains(fixture.AddedFinalizers, t14HoldFinalizer)).To(BeTrue(), "M2 finalizer release requires a recorded case-installed hold")
+		Expect(retry.RetryOnConflict(retry.DefaultRetry, func() error {
+			current := &corev1.ConfigMap{}
+			if err := m2GetSnapshot(labctx, key, current); err != nil {
+				return err
+			}
+			if current.UID != uid || !slices.Contains(current.Finalizers, t14HoldFinalizer) {
+				return fmt.Errorf("M2 finalizer release target UID/hold changed")
+			}
+			_, err := m2ReleaseCaseMetadata(labctx, current, fixture)
+			return err
+		})).To(Succeed())
+		return
+	}
 	Expect(retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		current := &corev1.ConfigMap{}
 		if err := admin.Get(labctx, key, current); err != nil {
@@ -242,7 +303,7 @@ func t14ReleaseHoldFinalizer(key client.ObjectKey, uid types.UID) {
 }
 
 var _ = Describe("KIND: Restart", func() {
-	It("preserves matching artifact and transition time after a full manager restart", func() {
+	m2It("preserves matching artifact and transition time after a full manager restart", func() {
 		p := createCR(runtimeNamespace, "restart-correct-")
 		assertArtifact(p)
 		beforeParent := &infrastructurev1alpha1.KeaCluster{}
@@ -252,7 +313,9 @@ var _ = Describe("KIND: Restart", func() {
 		Expect(beforeCondition).NotTo(BeNil())
 		oldPodUID := t14GetManagerPod(labctx).UID
 		original := t14GetManager(labctx)
-		DeferCleanup(func() { t14RestoreManager(original) })
+		if selectedProfile.milestone != "m2" {
+			DeferCleanup(func() { t14RestoreManager(original) })
+		}
 		Expect(t14ScaleManager(labctx, 0)).To(Succeed())
 		t14WaitStopped(labctx)
 		Consistently(func() types.UID { return t14CurrentArtifact(p).UID }, 2*time.Second, 200*time.Millisecond).Should(Equal(beforeArtifact.UID))
@@ -271,13 +334,15 @@ var _ = Describe("KIND: Restart", func() {
 		Expect(afterCondition.LastTransitionTime).To(Equal(beforeCondition.LastTransitionTime))
 	})
 
-	It("repairs payload and reserved metadata drift introduced during downtime", func() {
+	m2It("repairs payload and reserved metadata drift introduced during downtime", func() {
 		p := createCR(runtimeNamespace, "restart-drift-")
 		assertArtifact(p)
 		beforeParent := &infrastructurev1alpha1.KeaCluster{}
 		Expect(admin.Get(labctx, client.ObjectKeyFromObject(p), beforeParent)).To(Succeed())
 		original := t14GetManager(labctx)
-		DeferCleanup(func() { t14RestoreManager(original) })
+		if selectedProfile.milestone != "m2" {
+			DeferCleanup(func() { t14RestoreManager(original) })
+		}
 		Expect(t14ScaleManager(labctx, 0)).To(Succeed())
 		t14WaitStopped(labctx)
 		drifted := t14CurrentArtifact(p)
@@ -286,7 +351,7 @@ var _ = Describe("KIND: Restart", func() {
 		drifted.Labels["keaguard.example/artifact"] = "wrong"
 		drifted.Annotations["keaguard.example/purpose"] = "wrong"
 		drifted.BinaryData = map[string][]byte{"rogue-binary": []byte("remove")}
-		Expect(admin.Update(labctx, drifted)).To(Succeed())
+		Expect(m2UpdateObject(labctx, drifted, "restored")).To(Succeed())
 		Expect(t14SetManagerSpec(labctx, original.Spec)).To(Succeed())
 		t14WaitReady(labctx)
 		assertArtifact(p)
@@ -298,7 +363,7 @@ var _ = Describe("KIND: Restart", func() {
 		Expect(parentAfter.Generation).To(Equal(beforeParent.Generation))
 	})
 
-	It("recreates an artifact deleted during downtime without editing its parent", func() {
+	m2It("recreates an artifact deleted during downtime without editing its parent", func() {
 		p := createCR(runtimeNamespace, "restart-delete-")
 		assertArtifact(p)
 		beforeParent := &infrastructurev1alpha1.KeaCluster{}
@@ -306,10 +371,12 @@ var _ = Describe("KIND: Restart", func() {
 		beforeArtifact := t14CurrentArtifact(p)
 		oldPodUID := t14GetManagerPod(labctx).UID
 		original := t14GetManager(labctx)
-		DeferCleanup(func() { t14RestoreManager(original) })
+		if selectedProfile.milestone != "m2" {
+			DeferCleanup(func() { t14RestoreManager(original) })
+		}
 		Expect(t14ScaleManager(labctx, 0)).To(Succeed())
 		t14WaitStopped(labctx)
-		Expect(admin.Delete(labctx, beforeArtifact, client.Preconditions{UID: &beforeArtifact.UID})).To(Succeed())
+		Expect(m2DeleteObject(labctx, beforeArtifact, client.Preconditions{UID: &beforeArtifact.UID})).To(Succeed())
 		t14WaitUIDGone(client.ObjectKeyFromObject(p), beforeArtifact.UID)
 		Expect(t14SetManagerSpec(labctx, original.Spec)).To(Succeed())
 		t14WaitReady(labctx)
@@ -323,34 +390,38 @@ var _ = Describe("KIND: Restart", func() {
 		Expect(t14GetManagerPod(labctx).UID).NotTo(Equal(oldPodUID))
 	})
 
-	It("keeps an unowned collision untouched across restart, then recovers after fixture removal", func() {
+	m2It("keeps an unowned collision untouched across restart, then recovers after fixture removal", func() {
 		original := t14GetManager(labctx)
-		DeferCleanup(func() { t14RestoreManager(original) })
+		if selectedProfile.milestone != "m2" {
+			DeferCleanup(func() { t14RestoreManager(original) })
+		}
 		Expect(t14ScaleManager(labctx, 0)).To(Succeed())
 		t14WaitStopped(labctx)
 		collision := cm("", runtimeNamespace)
 		collision.GenerateName = "restart-conflict-"
-		Expect(admin.Create(labctx, collision)).To(Succeed())
+		Expect(m2CreateObject(labctx, collision, nil)).To(Succeed())
 		parent := cr(collision.Name, runtimeNamespace)
-		Expect(admin.Create(labctx, parent)).To(Succeed())
+		Expect(m2CreateObject(labctx, parent, nil)).To(Succeed())
 		Expect(t14SetManagerSpec(labctx, original.Spec)).To(Succeed())
 		t14WaitReady(labctx)
 		Eventually(func() string { return t14ConditionReason(parent) }, 120*time.Second, time.Second).Should(Equal("OwnershipConflict"))
 		unchanged := &corev1.ConfigMap{}
 		Expect(admin.Get(labctx, client.ObjectKeyFromObject(collision), unchanged)).To(Succeed())
 		Expect(unchanged).To(Equal(collision))
-		Expect(admin.Delete(labctx, collision, client.Preconditions{UID: &collision.UID})).To(Succeed())
+		Expect(m2DeleteObject(labctx, collision, client.Preconditions{UID: &collision.UID})).To(Succeed())
 		assertArtifact(parent)
 		Expect(t14CurrentArtifact(parent).UID).NotTo(Equal(collision.UID))
 	})
 
-	It("recovers committed artifact state after status permission failure and manager restart", func() {
+	m2It("recovers committed artifact state after status permission failure and manager restart", func() {
 		originalDeployment := t14GetManager(labctx)
 		originalRole := t14RemoveStatusPatch(labctx)
-		DeferCleanup(func() {
-			t14RestoreRoleRules(originalRole)
-			t14RestoreManager(originalDeployment)
-		})
+		if selectedProfile.milestone != "m2" {
+			DeferCleanup(func() {
+				t14RestoreRoleRules(originalRole)
+				t14RestoreManager(originalDeployment)
+			})
+		}
 		p := createCR(runtimeNamespace, "restart-status-")
 		Eventually(func() error {
 			actual := &corev1.ConfigMap{}
@@ -406,28 +477,29 @@ func TestUnitT14AdmissionErrorClassification(t *testing.T) {
 }
 
 var _ = Describe("KIND: Garbage collection", func() {
-	It("removes the recorded dependent UID through Kubernetes GC without runtime delete permission", func() {
+	m2It("removes the recorded dependent UID after manager stop and administrator parent deletion", func() {
 		p := createCR(runtimeNamespace, "gc-normal-")
 		assertArtifact(p)
 		child := t14CurrentArtifact(p)
-		role := &rbacv1.Role{}
-		Expect(admin.Get(labctx, client.ObjectKey{Namespace: runtimeNamespace, Name: "keaguard-manager-role"}, role)).To(Succeed())
-		for _, rule := range role.Rules {
-			Expect(rule.Verbs).NotTo(ContainElement("delete"), "runtime Role must not grant delete")
+		originalManager := t14GetManager(labctx)
+		if selectedProfile.milestone != "m2" {
+			DeferCleanup(func() { t14RestoreManager(originalManager) })
 		}
-		fmt.Fprintf(GinkgoWriter, "GC fixture parentUID=%s childUID=%s runtimeDeleteGrant=false\n", p.UID, child.UID)
+		Expect(t14ScaleManager(labctx, 0)).To(Succeed())
+		t14WaitStopped(labctx)
+		fmt.Fprintf(GinkgoWriter, "GC fixture parentUID=%s childUID=%s managerStopped=true parentDeleteActor=administrator\n", p.UID, child.UID)
 		t14DeleteParent(p)
 		t14WaitUIDGone(client.ObjectKeyFromObject(child), child.UID)
 	})
 
-	It("holds the old child UID, refuses same-name replacement adoption, then accepts a new owned UID", func() {
+	m2It("holds the old child UID, refuses same-name replacement adoption, then accepts a new owned UID", func() {
 		oldParent := createCR(runtimeNamespace, "gc-replace-")
 		assertArtifact(oldParent)
 		oldChild := t14CurrentArtifact(oldParent)
 		oldUID := oldChild.UID
 		oldChild.Finalizers = append(oldChild.Finalizers, t14HoldFinalizer)
-		Expect(admin.Update(labctx, oldChild)).To(Succeed())
-		Expect(admin.Delete(labctx, oldParent, client.Preconditions{UID: &oldParent.UID})).To(Succeed())
+		Expect(m2UpdateObject(labctx, oldChild, "absent")).To(Succeed())
+		Expect(m2DeleteObject(labctx, oldParent, client.Preconditions{UID: &oldParent.UID})).To(Succeed())
 		t14WaitParentGone(client.ObjectKeyFromObject(oldParent), oldParent.UID)
 		Eventual := func() *corev1.ConfigMap {
 			actual := &corev1.ConfigMap{}
@@ -441,7 +513,13 @@ var _ = Describe("KIND: Garbage collection", func() {
 		held := Eventual()
 		Expect(held.UID).To(Equal(oldUID))
 		newParent := cr(oldParent.Name, oldParent.Namespace)
-		Expect(admin.Create(labctx, newParent)).To(Succeed())
+		var predecessor *m2FixtureIdentity
+		if selectedProfile.milestone == "m2" {
+			identity, err := m2IdentityFor(oldParent)
+			Expect(err).NotTo(HaveOccurred())
+			predecessor = &identity
+		}
+		Expect(m2CreateObject(labctx, newParent, predecessor)).To(Succeed())
 		Expect(newParent.UID).NotTo(Equal(oldParent.UID))
 		Eventually(func() string { return t14ConditionReason(newParent) }, 120*time.Second, time.Second).Should(Equal("OwnershipConflict"))
 		stillOld := Eventual()
@@ -455,21 +533,28 @@ var _ = Describe("KIND: Garbage collection", func() {
 		replacement := t14CurrentArtifact(newParent)
 		Expect(replacement.UID).NotTo(Equal(oldUID))
 		Expect(metav1.GetControllerOf(replacement).UID).To(Equal(newParent.UID))
+		if selectedProfile.milestone == "m2" {
+			oldIdentity, oldErr := m2IdentityFor(oldChild)
+			newParentIdentity, parentErr := m2IdentityFor(newParent)
+			Expect(oldErr).NotTo(HaveOccurred())
+			Expect(parentErr).NotTo(HaveOccurred())
+			Expect(m2ActiveScenario.ObserveGeneratedSuccessor(labctx, oldIdentity, newParentIdentity)).To(Succeed())
+		}
 	})
 })
 
 var _ = Describe("KIND: Ownership cleanup limits", func() {
-	It("separates refusal of an unowned collision from explicit orphan deletion policy", func() {
+	m2It("separates refusal of an unowned collision from explicit orphan deletion policy", func() {
 		collision := cm("", runtimeNamespace)
 		collision.GenerateName = "limits-unowned-"
-		Expect(admin.Create(labctx, collision)).To(Succeed())
+		Expect(m2CreateObject(labctx, collision, nil)).To(Succeed())
 		parent := cr(collision.Name, runtimeNamespace)
-		Expect(admin.Create(labctx, parent)).To(Succeed())
+		Expect(m2CreateObject(labctx, parent, nil)).To(Succeed())
 		Eventually(func() string { return t14ConditionReason(parent) }, 120*time.Second, time.Second).Should(Equal("OwnershipConflict"))
 		unchanged := &corev1.ConfigMap{}
 		Expect(admin.Get(labctx, client.ObjectKeyFromObject(collision), unchanged)).To(Succeed())
 		Expect(unchanged).To(Equal(collision))
-		Expect(admin.Delete(labctx, collision, client.Preconditions{UID: &collision.UID})).To(Succeed())
+		Expect(m2DeleteObject(labctx, collision, client.Preconditions{UID: &collision.UID})).To(Succeed())
 		assertArtifact(parent)
 
 		child := t14CurrentArtifact(parent)
@@ -490,16 +575,16 @@ var _ = Describe("KIND: Ownership cleanup limits", func() {
 		observed, err := Eventual()
 		Expect(err).NotTo(HaveOccurred())
 		fmt.Fprintf(GinkgoWriter, "Explicit orphan policy left child UID=%s with %d owner references\n", observed.UID, len(observed.OwnerReferences))
-		Expect(admin.Delete(labctx, observed, client.Preconditions{UID: &observed.UID})).To(Succeed())
+		Expect(m2DeleteObject(labctx, observed, client.Preconditions{UID: &observed.UID})).To(Succeed())
 	})
 
-	It("records actual handling of valid dangling and malformed owner references", func() {
+	m2It("records actual handling of valid dangling and malformed owner references", func() {
 		dangling := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{
 			GenerateName: "limits-dangling-", Namespace: runtimeNamespace,
 			Labels: map[string]string{fixtureLabel: labCluster}, Finalizers: []string{t14HoldFinalizer},
 			OwnerReferences: []metav1.OwnerReference{{APIVersion: infrastructurev1alpha1.GroupVersion.String(), Kind: "KeaCluster", Name: "missing-t14-parent", UID: types.UID("missing-t14-parent-uid"), Controller: func() *bool { v := true; return &v }()}},
 		}}
-		err := admin.Create(labctx, dangling)
+		err := m2CreateExpectedOwnerReference(labctx, dangling)
 		if err != nil {
 			if !isExpectedOwnerReferenceAdmissionError(err) {
 				Fail(fmt.Sprintf("creating dangling-owner fixture failed outside owner-reference admission validation: %v", err))
@@ -536,7 +621,7 @@ var _ = Describe("KIND: Ownership cleanup limits", func() {
 				}
 				current = &corev1.ConfigMap{}
 				if err := admin.Get(labctx, client.ObjectKeyFromObject(dangling), current); err == nil {
-					Expect(admin.Delete(labctx, current, client.Preconditions{UID: &current.UID})).To(Succeed())
+					Expect(m2DeleteObject(labctx, current, client.Preconditions{UID: &current.UID})).To(Succeed())
 				}
 			}
 		}
@@ -546,7 +631,7 @@ var _ = Describe("KIND: Ownership cleanup limits", func() {
 			Labels:          map[string]string{fixtureLabel: labCluster},
 			OwnerReferences: []metav1.OwnerReference{{APIVersion: "not-a-group-version", Kind: "KeaCluster", Name: "invalid-t14-parent", UID: types.UID("invalid-t14-parent-uid")}},
 		}}
-		err = admin.Create(labctx, malformed)
+		err = m2CreateExpectedOwnerReference(labctx, malformed)
 		if err != nil {
 			if !isExpectedOwnerReferenceAdmissionError(err) {
 				Fail(fmt.Sprintf("creating malformed-owner fixture failed outside owner-reference admission validation: %v", err))
@@ -556,18 +641,18 @@ var _ = Describe("KIND: Ownership cleanup limits", func() {
 			return
 		}
 		fmt.Fprintf(GinkgoWriter, "API admitted malformed owner reference; fixture UID=%s\n", malformed.UID)
-		Expect(admin.Delete(labctx, malformed, client.Preconditions{UID: &malformed.UID})).To(Succeed())
+		Expect(m2DeleteObject(labctx, malformed, client.Preconditions{UID: &malformed.UID})).To(Succeed())
 	})
 
-	It("retains an artifact while another live owner remains, then collects it", func() {
+	m2It("retains an artifact while another live owner remains, then collects it", func() {
 		parent := createCR(runtimeNamespace, "limits-extra-owner-")
 		assertArtifact(parent)
 		child := t14CurrentArtifact(parent)
 		secondary := cm("", runtimeNamespace)
 		secondary.GenerateName = "limits-secondary-owner-"
-		Expect(admin.Create(labctx, secondary)).To(Succeed())
+		Expect(m2CreateObject(labctx, secondary, nil)).To(Succeed())
 		child.OwnerReferences = append(child.OwnerReferences, metav1.OwnerReference{APIVersion: "v1", Kind: "ConfigMap", Name: secondary.Name, UID: secondary.UID})
-		Expect(admin.Update(labctx, child)).To(Succeed())
+		Expect(m2UpdateObject(labctx, child, "absent")).To(Succeed())
 		parentUID, childUID, secondaryUID := parent.UID, child.UID, secondary.UID
 		t14DeleteParent(parent)
 		Consistently(func() bool {
@@ -578,7 +663,7 @@ var _ = Describe("KIND: Ownership cleanup limits", func() {
 			})
 		}, 3*time.Second, 300*time.Millisecond).Should(BeTrue())
 		fmt.Fprintf(GinkgoWriter, "Child UID=%s survived owner UID=%s while secondary owner UID=%s remained live\n", childUID, parentUID, secondaryUID)
-		Expect(admin.Delete(labctx, secondary, client.Preconditions{UID: &secondaryUID})).To(Succeed())
+		Expect(m2DeleteObject(labctx, secondary, client.Preconditions{UID: &secondaryUID})).To(Succeed())
 		t14WaitUIDGone(client.ObjectKeyFromObject(child), childUID)
 	})
 })

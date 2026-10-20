@@ -26,6 +26,7 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/rest"
@@ -48,13 +49,16 @@ var (
 
 func TestControllers(t *testing.T) {
 	RegisterFailHandler(Fail)
-	RunSpecs(t, "Controller Suite")
+	suiteConfig, reporterConfig := GinkgoConfiguration()
+	suiteConfig.FailOnEmpty = true
+	RunSpecs(t, "Controller Suite", suiteConfig, reporterConfig)
 }
 
 var _ = BeforeSuite(func() {
 	logf.SetLogger(zap.New(zap.WriteTo(GinkgoWriter), zap.UseDevMode(true)))
 	ctx, cancel = context.WithCancel(context.Background())
 	testScheme = runtime.NewScheme()
+	Expect(appsv1.AddToScheme(testScheme)).To(Succeed())
 	Expect(corev1.AddToScheme(testScheme)).To(Succeed())
 	Expect(infrastructurev1alpha1.AddToScheme(testScheme)).To(Succeed())
 	assets := os.Getenv("KUBEBUILDER_ASSETS")

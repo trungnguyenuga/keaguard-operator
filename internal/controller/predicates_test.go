@@ -144,7 +144,7 @@ func TestUnitRequeueContract(t *testing.T) {
 		p, base := coreUnitFixture(t)
 		r := newTestReconciler(base, base, p.Namespace)
 		out, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(p)})
-		if err != nil || out.RequeueAfter != 5*time.Minute {
+		if err != nil || out.RequeueAfter != time.Second {
 			t.Fatalf("%v %v", out, err)
 		}
 	})

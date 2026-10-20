@@ -36,7 +36,7 @@ func cm(name, ns string) *corev1.ConfigMap {
 func createCR(ns, prefix string) *infrastructurev1alpha1.KeaCluster {
 	p := cr("", ns)
 	p.GenerateName = prefix
-	Expect(admin.Create(labctx, p)).To(Succeed())
+	Expect(m2CreateObject(labctx, p, nil)).To(Succeed())
 	return p
 }
 func assertArtifact(p *infrastructurev1alpha1.KeaCluster) {
@@ -76,7 +76,7 @@ func forbidden(name string, err error) {
 }
 
 var _ = Describe("KIND: Runtime identity", func() {
-	It("uses the selected image and exact ServiceAccount with real namespaced requests", func() {
+	m2It("uses the selected image and exact ServiceAccount with real namespaced requests", func() {
 		var deployment appsv1.Deployment
 		Expect(admin.Get(labctx, client.ObjectKey{Namespace: runtimeNamespace, Name: managerName}, &deployment)).To(Succeed())
 		Expect(deployment.Spec.Template.Spec.ServiceAccountName).To(Equal(managerName))
@@ -122,7 +122,7 @@ var _ = Describe("KIND: Runtime identity", func() {
 			parent := createCR(ns, "identity-")
 			child := cm("", ns)
 			child.GenerateName = "identity-cm-"
-			Expect(admin.Create(labctx, child)).To(Succeed())
+			Expect(m2CreateObject(labctx, child, nil)).To(Succeed())
 			_, err = runtimeSet.CoreV1().ConfigMaps(ns).Get(labctx, child.Name, metav1.GetOptions{})
 			if ns == outsideNamespace {
 				forbidden("outside ConfigMap Get", err)
@@ -145,13 +145,30 @@ var _ = Describe("KIND: Runtime identity", func() {
 			}
 			candidate := cm("", ns)
 			candidate.GenerateName = "runtime-created-"
-			_, err = runtimeSet.CoreV1().ConfigMaps(ns).Create(labctx, candidate, metav1.CreateOptions{})
+			if selectedProfile.milestone == "m2" && ns == runtimeNamespace {
+				if m2ActiveScenario == nil {
+					Fail("M2 runtime-client Create lacks its scenario ledger")
+				}
+				err = m2ActiveScenario.createFixtureWith(labctx, candidate, nil, false, func(ctx context.Context, object client.Object) (client.Object, error) {
+					return runtimeSet.CoreV1().ConfigMaps(ns).Create(ctx, object.(*corev1.ConfigMap), metav1.CreateOptions{})
+				})
+			} else {
+				_, err = runtimeSet.CoreV1().ConfigMaps(ns).Create(labctx, candidate, metav1.CreateOptions{})
+			}
 			if ns == outsideNamespace {
 				forbidden("outside ConfigMap Create", err)
 			} else {
 				Expect(err).NotTo(HaveOccurred())
 			}
-			_, err = runtimeSet.CoreV1().ConfigMaps(ns).Patch(labctx, child.Name, types.MergePatchType, []byte(`{"data":{"patched":"yes"}}`), metav1.PatchOptions{})
+			patch := []byte(`{"data":{"patched":"yes"}}`)
+			if selectedProfile.milestone == "m2" && ns == runtimeNamespace {
+				observed := &corev1.ConfigMap{}
+				Expect(admin.Get(labctx, client.ObjectKeyFromObject(child), observed)).To(Succeed())
+				Expect(observed.UID).To(Equal(child.UID))
+				Expect(observed.ResourceVersion).NotTo(BeEmpty())
+				patch = []byte(fmt.Sprintf(`{"metadata":{"resourceVersion":%q},"data":{"patched":"yes"}}`, observed.ResourceVersion))
+			}
+			_, err = runtimeSet.CoreV1().ConfigMaps(ns).Patch(labctx, child.Name, types.MergePatchType, patch, metav1.PatchOptions{})
 			if ns == outsideNamespace {
 				forbidden("outside ConfigMap Patch", err)
 			} else {
@@ -186,7 +203,27 @@ var _ = Describe("KIND: Runtime identity", func() {
 			}
 			_, err = runtimeSet.CoreV1().ConfigMaps(ns).Update(labctx, child, metav1.UpdateOptions{})
 			forbidden(ns+" ConfigMap Update", err)
-			forbidden(ns+" ConfigMap Delete", runtimeSet.CoreV1().ConfigMaps(ns).Delete(labctx, child.Name, metav1.DeleteOptions{}))
+			deleteOptions := metav1.DeleteOptions{}
+			if selectedProfile.milestone == "m2" && ns == runtimeNamespace {
+				observed := &corev1.ConfigMap{}
+				Expect(admin.Get(labctx, client.ObjectKeyFromObject(child), observed)).To(Succeed())
+				Expect(observed.UID).To(Equal(child.UID))
+				Expect(observed.ResourceVersion).NotTo(BeEmpty())
+				deleteOptions.Preconditions = &metav1.Preconditions{UID: &observed.UID, ResourceVersion: &observed.ResourceVersion}
+			}
+			err = runtimeSet.CoreV1().ConfigMaps(ns).Delete(labctx, child.Name, deleteOptions)
+			if ns == outsideNamespace {
+				forbidden("outside ConfigMap Delete", err)
+			} else {
+				Expect(err).NotTo(HaveOccurred(), "in-scope disposable ConfigMap delete")
+				deleted := &corev1.ConfigMap{}
+				Expect(apierrors.IsNotFound(admin.Get(labctx, client.ObjectKeyFromObject(child), deleted))).To(BeTrue(), "in-scope fixture should be absent after runtime delete")
+				if selectedProfile.milestone == "m2" {
+					identity, identityErr := m2IdentityFor(child)
+					Expect(identityErr).NotTo(HaveOccurred())
+					Expect(m2ActiveScenario.VerifyAbsent(labctx, identity)).To(Succeed())
+				}
+			}
 			for _, patch := range []string{`{"spec":{}}`, `{"metadata":{"finalizers":["keaguard.example/fixture"]}}`} {
 				_, err = resource.Patch(labctx, parent.Name, types.MergePatchType, []byte(patch), metav1.PatchOptions{})
 				forbidden(ns+" parent spec/finalizer Patch", err)
@@ -203,10 +240,10 @@ var _ = Describe("KIND: Runtime identity", func() {
 	})
 })
 var _ = Describe("KIND: Core", func() {
-	It("creates internal artifacts, refuses collisions, recovers after removal and leaves outside fixtures unchanged", func() {
+	m2It("creates internal artifacts, refuses collisions, recovers after removal and leaves outside fixtures unchanged", func() {
 		outside := createCR(outsideNamespace, "outside-core-")
 		outsideCM := cm(outside.Name, outsideNamespace)
-		Expect(admin.Create(labctx, outsideCM)).To(Succeed())
+		Expect(m2CreateObject(labctx, outsideCM, nil)).To(Succeed())
 		beforeParent := outside.DeepCopy()
 		beforeCM := outsideCM.DeepCopy()
 		p := createCR(runtimeNamespace, "core-")
@@ -214,9 +251,9 @@ var _ = Describe("KIND: Core", func() {
 		// Create the collision before its CR, so the manager never had an ownership edge.
 		collision := cm("", runtimeNamespace)
 		collision.GenerateName = "collision-"
-		Expect(admin.Create(labctx, collision)).To(Succeed())
+		Expect(m2CreateObject(labctx, collision, nil)).To(Succeed())
 		blocked := cr(collision.Name, runtimeNamespace)
-		Expect(admin.Create(labctx, blocked)).To(Succeed())
+		Expect(m2CreateObject(labctx, blocked, nil)).To(Succeed())
 		Eventually(func(g Gomega) {
 			var current infrastructurev1alpha1.KeaCluster
 			g.Expect(admin.Get(labctx, client.ObjectKeyFromObject(blocked), &current)).To(Succeed())
@@ -231,7 +268,7 @@ var _ = Describe("KIND: Core", func() {
 		Expect(admin.Get(labctx, client.ObjectKeyFromObject(collision), &unchanged)).To(Succeed())
 		Expect(unchanged).To(Equal(*collision))
 		// Only this newly created test-owned collision is deleted, with UID precondition.
-		Expect(admin.Delete(labctx, collision, client.Preconditions{UID: &collision.UID})).To(Succeed())
+		Expect(m2DeleteObject(labctx, collision, client.Preconditions{UID: &collision.UID})).To(Succeed())
 		assertArtifact(blocked)
 		var afterParent infrastructurev1alpha1.KeaCluster
 		var afterCM corev1.ConfigMap
@@ -242,14 +279,22 @@ var _ = Describe("KIND: Core", func() {
 	})
 })
 var _ = Describe("KIND: Startup authorization", func() {
-	It("logs scoped authorization failures with an unbound identity and recovers after restoring the approved identity", func() {
+	m2It("logs scoped authorization failures with an unbound identity and recovers after restoring the approved identity", func() {
 		// Perturb only the verified test deployment; always restore the exact approved pod spec.
 		var original appsv1.Deployment
 		key := client.ObjectKey{Namespace: runtimeNamespace, Name: managerName}
 		Expect(admin.Get(labctx, key, &original)).To(Succeed())
 		sa := &corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{GenerateName: "unbound-", Namespace: runtimeNamespace, Labels: map[string]string{fixtureLabel: labCluster}}}
-		Expect(admin.Create(labctx, sa)).To(Succeed())
+		Expect(m2CreateObject(labctx, sa, nil)).To(Succeed())
 		restore := func() {
+			if selectedProfile.milestone == "m2" {
+				if m2ActiveScenario == nil {
+					Fail("M2 startup repair lacks its recorded scenario")
+				}
+				Expect(m2RestoreManager(labctx, m2ActiveScenario.Manager)).To(Succeed())
+				Expect(m2WaitManagerHealthy(labctx, m2ActiveScenario.ExpectedImage, m2ActiveScenario.ExpectedImageID, m2VerifyManagerDeployment)).To(Succeed())
+				return
+			}
 			ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 			defer cancel()
 			var current appsv1.Deployment
@@ -260,10 +305,16 @@ var _ = Describe("KIND: Startup authorization", func() {
 			out, err := kubectl(ctx, "rollout", "status", "deployment/"+managerName, "-n", runtimeNamespace, "--timeout=110s")
 			Expect(err).NotTo(HaveOccurred(), "%s", out)
 		}
-		DeferCleanup(restore)
+		if selectedProfile.milestone != "m2" {
+			DeferCleanup(restore)
+		}
 		current := original.DeepCopy()
 		current.Spec.Template.Spec.ServiceAccountName = sa.Name
-		Expect(admin.Patch(labctx, current, client.MergeFrom(&original))).To(Succeed())
+		if selectedProfile.milestone == "m2" {
+			Expect(m2PatchManagerSpec(labctx, m2ActiveScenario.Manager, func(spec *appsv1.DeploymentSpec) { spec.Template.Spec.ServiceAccountName = sa.Name })).To(Succeed())
+		} else {
+			Expect(admin.Patch(labctx, current, client.MergeFrom(&original))).To(Succeed())
+		}
 		Eventually(func(g Gomega) {
 			logs := managerLogs(labctx)
 			g.Expect(logs).To(ContainSubstring("forbidden"))
@@ -276,7 +327,13 @@ var _ = Describe("KIND: Startup authorization", func() {
 		Expect(admin.Get(labctx, key, &negative)).To(Succeed())
 		base := negative.DeepCopy()
 		negative.Spec.Template.Spec.Containers[0].Args = []string{"--watch-namespace=*"}
-		Expect(admin.Patch(labctx, &negative, client.MergeFrom(base))).To(Succeed())
+		if selectedProfile.milestone == "m2" {
+			Expect(m2PatchManagerSpec(labctx, m2ActiveScenario.Manager, func(spec *appsv1.DeploymentSpec) {
+				spec.Template.Spec.Containers[0].Args = []string{"--watch-namespace=*"}
+			})).To(Succeed())
+		} else {
+			Expect(admin.Patch(labctx, &negative, client.MergeFrom(base))).To(Succeed())
+		}
 		Eventually(func(g Gomega) {
 			logs := managerLogs(labctx)
 			g.Expect(logs).To(ContainSubstring("watch-namespace"))

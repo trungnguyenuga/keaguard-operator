@@ -25,8 +25,8 @@ func watchReason(key client.ObjectKey) string {
 	}
 	return c.Reason
 }
-func watchManager(namespace string, healthy, blocked time.Duration, suppress bool) (*KeaClusterReconciler, *managerRecordingClient) {
-	_, r, stop, err := startTestManager(ctx, namespace, healthy, blocked, suppress)
+func watchManager(namespace, identityName string, healthy, blocked time.Duration, suppress bool) (*KeaClusterReconciler, *managerRecordingClient) {
+	_, r, stop, err := startTestManager(ctx, namespace, identityName, healthy, blocked, suppress)
 	Expect(err).NotTo(HaveOccurred())
 	DeferCleanup(func() { Expect(stop()).To(Succeed()) })
 	return r, r.Client.(*managerRecordingClient)
@@ -54,7 +54,7 @@ var _ = Describe("ENV: Watch mapping", func() {
 	for _, replace := range []bool{false, true} {
 		It(fmt.Sprintf("delivers settled former-owner request after replacement=%v and label removal", replace), func() {
 			p, key := concurrencyParent()
-			_, c := watchManager(p.Namespace, time.Hour, time.Hour, false)
+			_, c := watchManager(p.Namespace, p.Name, time.Hour, time.Hour, false)
 			Eventually(func() string { return watchReason(key) }, 10*time.Second, 20*time.Millisecond).Should(Equal("ArtifactInSync"))
 			watchSettled(c)
 			n, o := c.requests.Load(), c.observations.Load()
@@ -78,7 +78,7 @@ var _ = Describe("ENV: Conflict polling", func() {
 		p, key := concurrencyParent()
 		cm := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: p.Name, Namespace: p.Namespace}, Data: map[string]string{"foreign": "retain"}}
 		Expect(k8sClient.Create(ctx, cm)).To(Succeed())
-		_, c := watchManager(p.Namespace, 200*time.Millisecond, 100*time.Millisecond, false)
+		_, c := watchManager(p.Namespace, p.Name, 200*time.Millisecond, 100*time.Millisecond, false)
 		Eventually(func() string { return watchReason(key) }, 10*time.Second, 20*time.Millisecond).Should(Equal("OwnershipConflict"))
 		n := c.requests.Load()
 		writes, status := c.otherWrites(), c.statusPatches()
@@ -95,7 +95,7 @@ var _ = Describe("ENV: Conflict polling", func() {
 var _ = Describe("ENV: Missed event", func() {
 	It("detects owner loss with safety polling then recovers with blocked polling", func() {
 		p, key := concurrencyParent()
-		_, c := watchManager(p.Namespace, 200*time.Millisecond, 100*time.Millisecond, true)
+		_, c := watchManager(p.Namespace, p.Name, 200*time.Millisecond, 100*time.Millisecond, true)
 		Eventually(func() string { return watchReason(key) }, 10*time.Second, 20*time.Millisecond).Should(Equal("ArtifactInSync"))
 		cm := watchChild(key)
 		cm.OwnerReferences = nil
@@ -125,7 +125,7 @@ var _ = Describe("ENV: Failure scheduling", func() {
 				cm.Data = map[string]string{"drift": "x"}
 				Expect(k8sClient.Create(ctx, cm)).To(Succeed())
 			}
-			_, r, stop, err := startTestManager(context.WithValue(ctx, managerFaultKey{}, stage), ns.Name, time.Hour, time.Hour, false)
+			_, r, stop, err := startTestManager(context.WithValue(ctx, managerFaultKey{}, stage), ns.Name, p.Name, time.Hour, time.Hour, false)
 			Expect(err).NotTo(HaveOccurred())
 			DeferCleanup(func() { Expect(stop()).To(Succeed()) })
 			c := r.Client.(*managerRecordingClient)

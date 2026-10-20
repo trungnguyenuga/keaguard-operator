@@ -1,0 +1,17 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: keaguard-m2-runtime
+  labels:
+    keaguard.example/e2e-owner: keaguard-m2-disposable
+    pod-security.kubernetes.io/enforce: privileged
+    pod-security.kubernetes.io/enforce-version: v1.37
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: keaguard-m2-outside
+  labels:
+    keaguard.example/e2e-owner: keaguard-m2-disposable
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: v1.37

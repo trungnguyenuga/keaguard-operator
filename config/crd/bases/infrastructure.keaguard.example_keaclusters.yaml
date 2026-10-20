@@ -38,6 +38,26 @@ spec:
             type: object
           spec:
             description: spec defines the desired state of KeaCluster
+            properties:
+              workload:
+                description: Workload optionally configures the fixed Kea process
+                  workload.
+                properties:
+                  enabled:
+                    description: Enabled opts in to managing the Kea process workload.
+                    type: boolean
+                  loggingSeverity:
+                    description: LoggingSeverity selects the Kea log threshold; omission
+                      is interpreted as INFO.
+                    enum:
+                    - DEBUG
+                    - INFO
+                    - WARN
+                    - ERROR
+                    - FATAL
+                    - NONE
+                    type: string
+                type: object
             type: object
           status:
             description: status defines the observed state of KeaCluster

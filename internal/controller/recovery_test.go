@@ -27,11 +27,12 @@ import (
 // Recorder counts submissions separately from administrative fixture operations.
 type recoveryClient struct {
 	*statusRecordingClient
-	read             func(context.Context, client.Object) error
-	writeErr         error
-	forward          bool
-	after            func(context.Context, *corev1.ConfigMap)
-	creates, patches int
+	read                      func(context.Context, client.Object) error
+	writeErr                  error
+	forward                   bool
+	after                     func(context.Context, *corev1.ConfigMap)
+	afterObject               func(context.Context, client.Object)
+	creates, patches, deletes int
 }
 
 func (c *recoveryClient) Get(ctx context.Context, k client.ObjectKey, o client.Object, opts ...client.GetOption) error {
@@ -46,43 +47,82 @@ func (c *recoveryClient) Create(ctx context.Context, o client.Object, opts ...cl
 	c.creates++
 	c.recordResourceWrite()
 	if c.writeErr != nil && !c.forward {
+		c.recordOperation("create", o, c.writeErr)
 		return c.writeErr
 	}
 	if err := c.Client.Create(ctx, o, opts...); err != nil {
+		c.recordOperation("create", o, err)
 		return err
 	}
-	if c.after != nil {
-		c.after(ctx, o.(*corev1.ConfigMap))
-	}
+	c.afterMutation(ctx, o)
+	c.recordOperation("create", o, c.writeErr)
 	return c.writeErr
 }
 func (c *recoveryClient) Patch(ctx context.Context, o client.Object, p client.Patch, opts ...client.PatchOption) error {
 	c.patches++
 	c.recordResourceWrite()
 	if c.writeErr != nil && !c.forward {
+		c.recordOperation("patch", o, c.writeErr)
 		return c.writeErr
 	}
 	if err := c.Client.Patch(ctx, o, p, opts...); err != nil {
+		c.recordOperation("patch", o, err)
 		return err
 	}
-	if c.after != nil {
-		c.after(ctx, o.(*corev1.ConfigMap))
-	}
+	c.afterMutation(ctx, o)
+	c.recordOperation("patch", o, c.writeErr)
 	return c.writeErr
+}
+
+func (c *recoveryClient) Delete(ctx context.Context, o client.Object, opts ...client.DeleteOption) error {
+	c.deletes++
+	c.recordResourceWrite()
+	if c.writeErr != nil && !c.forward {
+		c.recordOperation("delete", o, c.writeErr)
+		return c.writeErr
+	}
+	if err := c.Client.Delete(ctx, o, opts...); err != nil {
+		c.recordOperation("delete", o, err)
+		return err
+	}
+	c.afterMutation(ctx, o)
+	c.recordOperation("delete", o, c.writeErr)
+	return c.writeErr
+}
+
+func (c *recoveryClient) afterMutation(ctx context.Context, object client.Object) {
+	if c.afterObject != nil {
+		c.afterObject(ctx, object)
+	}
+	if c.after != nil {
+		if configMap, ok := object.(*corev1.ConfigMap); ok {
+			c.after(ctx, configMap)
+		}
+	}
 }
 
 type recoveryReader struct {
 	client.Reader
-	read func(context.Context, client.Object) error
+	readAt   func(context.Context, client.ObjectKey, client.Object) error
+	readList func(context.Context, client.ObjectList) error
 }
 
 func (r *recoveryReader) Get(ctx context.Context, k client.ObjectKey, o client.Object, opts ...client.GetOption) error {
-	if r.read != nil {
-		if err := r.read(ctx, o); err != nil {
+	if r.readAt != nil {
+		if err := r.readAt(ctx, k, o); err != nil {
 			return err
 		}
 	}
 	return r.Reader.Get(ctx, k, o, opts...)
+}
+
+func (r *recoveryReader) List(ctx context.Context, list client.ObjectList, opts ...client.ListOption) error {
+	if r.readList != nil {
+		if err := r.readList(ctx, list); err != nil {
+			return err
+		}
+	}
+	return r.Reader.List(ctx, list, opts...)
 }
 
 // Catches missing failure observations, swallowed retry errors, false definitive
@@ -107,13 +147,13 @@ func TestUnitFailureOutcomes(t *testing.T) {
 			c := &recoveryClient{statusRecordingClient: &statusRecordingClient{Client: base}}
 			reader := &recoveryReader{Reader: base}
 			parents, children := 0, 0
-			reader.read = func(_ context.Context, o client.Object) error {
-				if _, ok := o.(*corev1.ConfigMap); ok {
+			reader.readAt = func(_ context.Context, readKey client.ObjectKey, o client.Object) error {
+				if _, ok := o.(*corev1.ConfigMap); ok && readKey == key {
 					children++
 					if stage == "child" || ((stage == "unknown" || stage == "rejected-unobserved") && children > 1) {
 						return operation
 					}
-				} else {
+				} else if _, ok := o.(*infrastructurev1alpha1.KeaCluster); ok && readKey == key {
 					parents++
 					if (stage == "fresh-parent" && parents == 1) || stage == "status-read" {
 						return operation
@@ -228,7 +268,7 @@ func TestUnitMutationResponse(t *testing.T) {
 					}
 				}}
 				result, err := newTestReconciler(c, base, p.Namespace).Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(p)})
-				if err != nil || result.RequeueAfter != 30*time.Second || c.otherWrites() != 1 {
+				if err != nil || result.RequeueAfter != time.Second || c.otherWrites() != 1 {
 					t.Fatalf("result=%+v err=%v writes=%d", result, err, c.otherWrites())
 				}
 				assertArtifactCondition(t, base, p, reason, metav1.ConditionFalse)
@@ -274,9 +314,9 @@ func TestUnitCancellation(t *testing.T) {
 					t.Fatal("held operation ignored cancellation")
 				}
 			}
-			reader := &recoveryReader{Reader: base, read: func(ctx context.Context, o client.Object) error {
+			reader := &recoveryReader{Reader: base, readAt: func(ctx context.Context, readKey client.ObjectKey, o client.Object) error {
 				check(ctx)
-				if phase == "before-mutation" {
+				if phase == "before-mutation" && readKey == key {
 					if _, ok := o.(*infrastructurev1alpha1.KeaCluster); ok {
 						cancel()
 					}
@@ -350,8 +390,8 @@ var _ = Describe("ENV: Lost response", func() {
 				observation := errors.New("modelled follow-up failure")
 				children := 0
 				c := &recoveryClient{statusRecordingClient: &statusRecordingClient{Client: k8sClient}, writeErr: lost, forward: true}
-				reader := &recoveryReader{Reader: k8sClient, read: func(_ context.Context, o client.Object) error {
-					if _, ok := o.(*corev1.ConfigMap); ok {
+				reader := &recoveryReader{Reader: k8sClient, readAt: func(_ context.Context, readKey client.ObjectKey, o client.Object) error {
+					if _, ok := o.(*corev1.ConfigMap); ok && readKey == key {
 						children++
 						if unknown && children > 1 {
 							return observation

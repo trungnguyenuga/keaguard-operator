@@ -1,0 +1,9 @@
+apiVersion: infrastructure.keaguard.example/v1alpha1
+kind: KeaCluster
+metadata:
+  name: keacluster-m2-sample
+  namespace: keaguard-m2-runtime
+spec:
+  workload:
+    enabled: true
+    loggingSeverity: INFO

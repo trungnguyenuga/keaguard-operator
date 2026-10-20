@@ -19,8 +19,8 @@ import (
 // Restart regressions catch lost initial-list delivery, status churn, reliance on
 // old queue/patch memory, and ownership/lifecycle checks bypassed after startup.
 // Every manager has a new cache/reconciler/recorder; fixtures use the API client.
-func restartManager(parent context.Context, namespace string, blocked time.Duration) (*managerRecordingClient, func() error) {
-	_, r, stop, err := startTestManager(parent, namespace, time.Hour, blocked, false)
+func restartManager(parent context.Context, namespace, identityName string, blocked time.Duration) (*managerRecordingClient, func() error) {
+	_, r, stop, err := startTestManager(parent, namespace, identityName, time.Hour, blocked, false)
 	Expect(err).NotTo(HaveOccurred())
 	DeferCleanup(func() { Expect(stop()).To(Succeed()) })
 	return r.Client.(*managerRecordingClient), stop
@@ -60,7 +60,7 @@ func restartInSync(key client.ObjectKey, p *infrastructurev1alpha1.KeaCluster, c
 }
 func restartHealthy() (*infrastructurev1alpha1.KeaCluster, client.ObjectKey, *managerRecordingClient, func() error) {
 	p, key := concurrencyParent()
-	c, stop := restartManager(ctx, p.Namespace, time.Hour)
+	c, stop := restartManager(ctx, p.Namespace, p.Name, time.Hour)
 	restartInSync(key, p, c)
 	watchSettled(c)
 	return p, key, c, stop
@@ -75,7 +75,7 @@ var _ = Describe("ENV: Restart correct", func() {
 		beforeParent, beforeChild := restartParent(key), watchChild(key)
 		Expect(stop()).To(Succeed())
 		n := old.requests.Load()
-		fresh, _ := restartManager(ctx, p.Namespace, time.Hour)
+		fresh, _ := restartManager(ctx, p.Namespace, p.Name, time.Hour)
 		Expect(fresh).NotTo(BeIdenticalTo(old))
 		restartInSync(key, p, fresh)
 		restartNoWrites(fresh)
@@ -98,7 +98,7 @@ var _ = Describe("ENV: Restart drift", func() {
 		writes := old.otherWrites()
 		Consistently(func() *corev1.ConfigMap { return watchChild(key) }, 600*time.Millisecond, 20*time.Millisecond).Should(Equal(cm))
 		Expect(old.otherWrites()).To(Equal(writes))
-		fresh, _ := restartManager(ctx, p.Namespace, time.Hour)
+		fresh, _ := restartManager(ctx, p.Namespace, p.Name, time.Hour)
 		// Persisted True alone is insufficient: require actual repaired payload.
 		Eventually(func() map[string]string { return watchChild(key).Data }, 10*time.Second, 20*time.Millisecond).Should(Equal(map[string]string{"keacluster-name": p.Name, "keacluster-namespace": p.Namespace, "keacluster-uid": string(p.UID)}))
 		restartInSync(key, p, fresh)
@@ -122,7 +122,7 @@ var _ = Describe("ENV: Restart missing", func() {
 		writes := old.otherWrites()
 		Consistently(func() bool { return apierrors.IsNotFound(k8sClient.Get(ctx, key, &corev1.ConfigMap{})) }, 600*time.Millisecond, 20*time.Millisecond).Should(BeTrue())
 		Expect(old.otherWrites()).To(Equal(writes))
-		fresh, _ := restartManager(ctx, p.Namespace, time.Hour)
+		fresh, _ := restartManager(ctx, p.Namespace, p.Name, time.Hour)
 		Eventually(func() error { return k8sClient.Get(ctx, key, &corev1.ConfigMap{}) }, 10*time.Second, 20*time.Millisecond).Should(Succeed())
 		restartInSync(key, p, fresh)
 		Expect(watchChild(key).UID).NotTo(Equal(cm.UID))
@@ -156,12 +156,12 @@ var _ = Describe("ENV: Restart interrupted", func() {
 				Expect(k8sClient.Delete(ctx, cm)).To(Succeed())
 				cm = watchChild(key)
 			}
-			first, stopBlocked := restartManager(ctx, p.Namespace, 100*time.Millisecond)
+			first, stopBlocked := restartManager(ctx, p.Namespace, p.Name, 100*time.Millisecond)
 			Eventually(func() string { return watchReason(key) }, 10*time.Second, 20*time.Millisecond).Should(Equal(reason))
 			Expect(first.otherWrites()).To(BeZero())
 			Expect(stopBlocked()).To(Succeed())
 			blockedParent := restartParent(key)
-			fresh, _ := restartManager(ctx, p.Namespace, 100*time.Millisecond)
+			fresh, _ := restartManager(ctx, p.Namespace, p.Name, 100*time.Millisecond)
 			Eventually(func() int64 { return fresh.observations.Load() }, 10*time.Second, 20*time.Millisecond).Should(BeNumerically(">=", 3))
 			restartNoWrites(fresh)
 			Expect(watchChild(key)).To(Equal(cm))
@@ -201,7 +201,7 @@ var _ = Describe("ENV: Restart interrupted", func() {
 			cm := watchChild(key) // envtest has no GC; leaving it proves no repair/status.
 			cm.Data = map[string]string{"drift": "remain"}
 			Expect(k8sClient.Update(ctx, cm)).To(Succeed())
-			fresh, stopFresh := restartManager(ctx, p.Namespace, time.Hour)
+			fresh, stopFresh := restartManager(ctx, p.Namespace, p.Name, time.Hour)
 			if terminating {
 				Eventually(func() int64 { return fresh.requests.Load() }, 10*time.Second, 20*time.Millisecond).Should(BeNumerically(">", 0))
 			}
@@ -230,7 +230,7 @@ var _ = Describe("ENV: Restart interrupted", func() {
 		replacement := &infrastructurev1alpha1.KeaCluster{ObjectMeta: metav1.ObjectMeta{Name: key.Name, Namespace: key.Namespace}}
 		Expect(k8sClient.Create(ctx, replacement)).To(Succeed())
 		Expect(replacement.UID).NotTo(Equal(old.UID))
-		fresh, _ := restartManager(ctx, old.Namespace, 100*time.Millisecond)
+		fresh, _ := restartManager(ctx, old.Namespace, old.Name, 100*time.Millisecond)
 		Eventually(func() string { return watchReason(key) }, 10*time.Second, 20*time.Millisecond).Should(Equal("OwnershipConflict"))
 		Eventually(func() int64 { return fresh.observations.Load() }, 10*time.Second, 20*time.Millisecond).Should(BeNumerically(">=", 3))
 		Expect(fresh.otherWrites()).To(BeZero())
@@ -243,13 +243,13 @@ var _ = Describe("ENV: Restart interrupted", func() {
 	})
 	It("observes committed artifact after failed status using a fresh manager without duplicate creation", func() {
 		p, key := concurrencyParent()
-		first, stop := restartManager(context.WithValue(ctx, managerFaultKey{}, "status"), p.Namespace, time.Hour)
+		first, stop := restartManager(context.WithValue(ctx, managerFaultKey{}, "status"), p.Namespace, p.Name, time.Hour)
 		Eventually(func() int64 { return first.attempts.Load() }, 10*time.Second, 20*time.Millisecond).Should(BeNumerically(">", 0))
 		Expect(stop()).To(Succeed())
 		cm := watchChild(key)
 		Expect(first.otherWrites()).To(Equal(1))
 		Expect(restartParent(key).Status.Conditions).To(BeEmpty())
-		fresh, _ := restartManager(ctx, p.Namespace, time.Hour)
+		fresh, _ := restartManager(ctx, p.Namespace, p.Name, time.Hour)
 		restartInSync(key, p, fresh)
 		Expect(fresh.otherWrites()).To(BeZero())
 		Expect(fresh.statusPatches()).To(Equal(1))
@@ -271,7 +271,7 @@ var _ = Describe("ENV: Restart interrupted", func() {
 		Expect(errors.Is(err, context.Canceled)).To(BeTrue())
 		Expect(recorder.otherWrites()).To(Equal(1))
 		committed := watchChild(key)
-		fresh, _ := restartManager(ctx, p.Namespace, time.Hour)
+		fresh, _ := restartManager(ctx, p.Namespace, p.Name, time.Hour)
 		restartInSync(key, p, fresh)
 		restartNoWrites(fresh)
 		Expect(watchChild(key)).To(Equal(committed))
@@ -279,12 +279,12 @@ var _ = Describe("ENV: Restart interrupted", func() {
 	It("automatically recovers a temporary observation failure cleared after restart", func() {
 		p, key, _, stop := restartHealthy()
 		Expect(stop()).To(Succeed())
-		first, stopFailed := restartManager(context.WithValue(ctx, managerFaultKey{}, "child"), p.Namespace, time.Hour)
+		first, stopFailed := restartManager(context.WithValue(ctx, managerFaultKey{}, "child"), p.Namespace, p.Name, time.Hour)
 		Eventually(func() string { return watchReason(key) }, 10*time.Second, 20*time.Millisecond).Should(Equal("ObservationFailed"))
 		Expect(first.otherWrites()).To(BeZero())
 		Expect(stopFailed()).To(Succeed())
 		cm := watchChild(key)
-		fresh, _ := restartManager(context.WithValue(ctx, managerFaultKey{}, "child"), p.Namespace, time.Hour)
+		fresh, _ := restartManager(context.WithValue(ctx, managerFaultKey{}, "child"), p.Namespace, p.Name, time.Hour)
 		Eventually(func() int64 { return fresh.attempts.Load() }, 10*time.Second, 20*time.Millisecond).Should(BeNumerically(">=", 2))
 		Expect(fresh.otherWrites()).To(BeZero())
 		Expect(fresh.statusPatches()).To(BeZero())

@@ -21,9 +21,25 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 )
 
-// KeaClusterSpec is intentionally empty in M1. No operational Kea configuration
-// is accepted by this version.
-type KeaClusterSpec struct{}
+// KeaClusterSpec contains optional desired workload settings. An omitted
+// workload remains disabled for metadata-only M1 resources.
+type KeaClusterSpec struct {
+	// Workload optionally configures the fixed Kea process workload.
+	// +optional
+	Workload *KeaWorkloadSpec `json:"workload,omitempty"`
+}
+
+// KeaWorkloadSpec controls whether the fixed Kea process workload is enabled.
+type KeaWorkloadSpec struct {
+	// Enabled opts in to managing the Kea process workload.
+	// +optional
+	Enabled bool `json:"enabled,omitempty"`
+
+	// LoggingSeverity selects the Kea log threshold; omission is interpreted as INFO.
+	// +kubebuilder:validation:Enum=DEBUG;INFO;WARN;ERROR;FATAL;NONE
+	// +optional
+	LoggingSeverity *string `json:"loggingSeverity,omitempty"`
+}
 
 // KeaClusterStatus records artifact observations, not Kea or DHCP availability.
 type KeaClusterStatus struct {

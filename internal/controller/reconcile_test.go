@@ -9,6 +9,7 @@ import (
 	"time"
 
 	infrastructurev1alpha1 "github.com/trungnguyenuga/keaguard-operator/api/v1alpha1"
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -24,6 +25,9 @@ import (
 func coreUnitFixture(t *testing.T) (*infrastructurev1alpha1.KeaCluster, client.Client) {
 	t.Helper()
 	s := runtime.NewScheme()
+	if err := appsv1.AddToScheme(s); err != nil {
+		t.Fatal(err)
+	}
 	if err := corev1.AddToScheme(s); err != nil {
 		t.Fatal(err)
 	}
@@ -32,6 +36,28 @@ func coreUnitFixture(t *testing.T) (*infrastructurev1alpha1.KeaCluster, client.C
 	}
 	p := &infrastructurev1alpha1.KeaCluster{ObjectMeta: metav1.ObjectMeta{Name: "example", Namespace: "scope", UID: "parent-uid", Generation: 1}}
 	return p, fake.NewClientBuilder().WithScheme(s).WithStatusSubresource(&infrastructurev1alpha1.KeaCluster{}).WithObjects(p).Build()
+}
+
+func TestUnitM2IdentityExtraction(t *testing.T) {
+	p, base := coreUnitFixture(t)
+	writer := &statusRecordingClient{Client: base}
+	reader := &coreRecordingReader{Reader: base}
+	r := newTestReconciler(writer, reader, p.Namespace)
+	missing := &corev1.ConfigMap{}
+	err := r.APIReader.Get(context.Background(), client.ObjectKeyFromObject(p), missing)
+	if !apierrors.IsNotFound(err) {
+		t.Fatalf("fixture identity should be absent: %v", err)
+	}
+	condition, action := r.reconcileArtifact(context.Background(), p, nil, err, true)
+	if action.Err != nil || !action.Mutated || action.Result.RequeueAfter != time.Second || condition.Type != "ArtifactReconciled" {
+		t.Fatalf("identity action: condition=%+v action=%+v", condition, action)
+	}
+	if writer.statusPatches() != 0 {
+		t.Fatalf("identity helper wrote status itself: %d patches", writer.statusPatches())
+	}
+	if err := base.Get(context.Background(), client.ObjectKeyFromObject(p), &corev1.ConfigMap{}); err != nil {
+		t.Fatalf("identity mutation was not submitted: %v", err)
+	}
 }
 
 // Catches an empty reconciler, duplicate creates, status churn, and redundant
@@ -43,14 +69,14 @@ func TestUnitCreateAndNoop(t *testing.T) {
 	r := newTestReconciler(c, reader, p.Namespace)
 	req := ctrl.Request{NamespacedName: client.ObjectKeyFromObject(p)}
 	result, err := r.Reconcile(context.Background(), req)
-	if err != nil || result.RequeueAfter != 5*time.Minute {
+	if err != nil || result.RequeueAfter != time.Second {
 		t.Fatalf("create result=%v err=%v", result, err)
 	}
 	if c.creates != 1 || c.otherWrites() != 1 || c.statusPatches() != 1 {
 		t.Fatalf("create=%d resource writes=%d status patches=%d", c.creates, c.otherWrites(), c.statusPatches())
 	}
-	if reader.parents != 2 || reader.children != 1 {
-		t.Fatalf("create reads: parent=%d child=%d", reader.parents, reader.children)
+	if reader.parents != 2 || reader.children != 4 || reader.lists != 1 {
+		t.Fatalf("create reads: parent=%d child=%d lists=%d", reader.parents, reader.children, reader.lists)
 	}
 	cm := &corev1.ConfigMap{}
 	if err := base.Get(context.Background(), req.NamespacedName, cm); err != nil {
@@ -208,7 +234,7 @@ func TestUnitDriftRepair(t *testing.T) {
 			r := newTestReconciler(c, reader, p.Namespace)
 			req := ctrl.Request{NamespacedName: client.ObjectKeyFromObject(p)}
 			result, err := r.Reconcile(context.Background(), req)
-			if err != nil || result.RequeueAfter != 5*time.Minute {
+			if err != nil || result.RequeueAfter != time.Second {
 				t.Fatalf("repair result=%v err=%v", result, err)
 			}
 			if c.otherWrites() != 1 || c.artifactPatches != 1 || c.statusPatches() != 1 {
@@ -413,7 +439,7 @@ func testRepairResponse(t *testing.T) {
 			c := &repairRecordingClient{statusRecordingClient: &statusRecordingClient{Client: base}, response: tc.change}
 			r := newTestReconciler(c, base, p.Namespace)
 			result, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(p)})
-			if err != nil || result.RequeueAfter != 30*time.Second {
+			if err != nil || result.RequeueAfter != time.Second {
 				t.Fatalf("response result=%v err=%v", result, err)
 			}
 			if c.otherWrites() != 1 || c.artifactPatches != 1 {

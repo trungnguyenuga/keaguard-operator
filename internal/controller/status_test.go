@@ -37,6 +37,45 @@ func statusFixture(t *testing.T, objects ...client.Object) (*statusRecordingClie
 	return &statusRecordingClient{Client: base}, base
 }
 
+func TestUnitM2StatusBatch(t *testing.T) {
+	origin := statusParent()
+	prior := metav1.Condition{Type: "ExternalCheck", Status: metav1.ConditionTrue, Reason: "External", Message: "preserve", LastTransitionTime: statusTime}
+	origin.Status.Conditions = []metav1.Condition{prior}
+	first := artifactCondition(metav1.ConditionTrue, "ArtifactInSync")
+	second := metav1.Condition{Type: "WorkloadReconciled", Status: metav1.ConditionFalse, Reason: "Disabled", Message: "workload disabled", ObservedGeneration: origin.Generation, LastTransitionTime: statusTime}
+	got, changed := withConditions(origin.Status, first, second)
+	if !changed || len(got.Conditions) != 3 || !reflect.DeepEqual(got.Conditions[0], prior) {
+		t.Fatalf("batch did not preserve unrelated condition: %+v changed=%v", got, changed)
+	}
+	second.Message = "updated explanation"
+	second.Reason = "Waiting"
+	got, changed = withConditions(got, first, second)
+	workload := meta.FindStatusCondition(got.Conditions, "WorkloadReconciled")
+	if !changed || workload == nil || workload.Reason != "Waiting" || !workload.LastTransitionTime.Equal(&statusTime) {
+		t.Fatalf("same-status batch changed transition time incorrectly: %+v", workload)
+	}
+	parent := statusParent()
+	parent.Status = infrastructurev1alpha1.KeaClusterStatus{Conditions: []metav1.Condition{prior}}
+	recorder, base := statusFixture(t, parent)
+	r := newTestReconciler(recorder, base, parent.Namespace)
+	result, err := r.finishConditions(context.Background(), parent, []metav1.Condition{first, second}, ctrl.Result{RequeueAfter: time.Second}, nil)
+	if err != nil || result.RequeueAfter != time.Second || recorder.statusPatches() != 1 {
+		t.Fatalf("batched status result=%v err=%v patches=%d", result, err, recorder.statusPatches())
+	}
+	result, err = r.finishConditions(context.Background(), parent, []metav1.Condition{first, second}, ctrl.Result{RequeueAfter: 2 * time.Second}, nil)
+	if err != nil || result.RequeueAfter != 2*time.Second || recorder.statusPatches() != 1 {
+		t.Fatalf("unchanged status was not suppressed: result=%v err=%v patches=%d", result, err, recorder.statusPatches())
+	}
+	patchFailure := errors.New("status batch unavailable")
+	recorder.patchErr = patchFailure
+	operationFailure := errors.New("resource action failed")
+	third := metav1.Condition{Type: "WorkloadReady", Status: metav1.ConditionUnknown, Reason: "ObservationFailed", Message: "not observed", ObservedGeneration: parent.Generation, LastTransitionTime: statusTime}
+	_, err = r.finishConditions(context.Background(), parent, []metav1.Condition{first, second, third}, ctrl.Result{}, operationFailure)
+	if !errors.Is(err, patchFailure) || !errors.Is(err, operationFailure) {
+		t.Fatalf("joined action/status failures lost an error: %v", err)
+	}
+}
+
 // Catches lost/incorrect evidence categories and observed generation on unsuccessful outcomes.
 func TestUnitArtifactConditions(t *testing.T) {
 	for _, tc := range []struct {

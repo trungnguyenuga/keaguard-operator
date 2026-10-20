@@ -63,6 +63,16 @@ test-envtest: toolchain-check envtest ## Run envtest with installed, pinned asse
 
 # All Kind operations require the explicit disposable selection; never create/delete implicitly.
 .PHONY: kind-image-required kind-create test-kind
+# The amended M2 profile needs a serial 70-minute Ginkgo budget inside the
+# 75-minute Go process limit. Keep the existing M1 bounds unchanged.
+ifeq ($(KEAGUARD_E2E_MILESTONE),m2)
+KIND_GO_TIMEOUT := 75m
+KIND_GINKGO_TIMEOUT := 70m
+else
+KIND_GO_TIMEOUT := 25m
+KIND_GINKGO_TIMEOUT := 24m
+endif
+
 kind-image-required:
 	@case "$(origin IMG)" in "command line"|"environment") ;; *) echo 'explicit IMG= required for Kind' >&2; exit 1;; esac
 	@test -n "$(strip $(IMG))" || { echo 'explicit IMG= required for Kind' >&2; exit 1; }
@@ -72,7 +82,7 @@ kind-create: kind-image-required toolchain-check
 
 test-kind: kind-image-required toolchain-check
 	@test "$${KEAGUARD_E2E:-}" = 1 || { echo 'KEAGUARD_E2E=1 is required' >&2; exit 1; }
-	IMG="$(IMG)" go test ./test/e2e -run '^TestE2E$$' -count=1 -timeout=25m -ginkgo.timeout=24m -ginkgo.focus='$(GINKGO_FOCUS)' -v
+	IMG="$(IMG)" go test ./test/e2e -run '^TestE2E$$' -count=1 -timeout=$(KIND_GO_TIMEOUT) -ginkgo.timeout=$(KIND_GINKGO_TIMEOUT) -ginkgo.focus='$(GINKGO_FOCUS)' -v
 
 .PHONY: lint
 lint: golangci-lint ## Run golangci-lint linter
@@ -95,7 +105,17 @@ build: manifests generate fmt vet ## Build manager binary.
 # The Dockerfile pins both image digests and the Linux amd64 compiler.
 .PHONY: docker-build
 docker-build: toolchain-check ## Build the digest-pinned M1 manager image locally.
+ifneq ($(strip $(BUILD_IID_FILE)),)
+ifneq ($(BUILD_IID_FILE),/tmp/keaguard-m2-acceptance/manager-image.iid)
+$(error BUILD_IID_FILE must use the reviewed private M2 path)
+endif
+	@test -d /tmp/keaguard-m2-acceptance && test ! -L /tmp/keaguard-m2-acceptance
+	@test "$$(stat -c %a /tmp/keaguard-m2-acceptance)" = 700
+	@test ! -e /tmp/keaguard-m2-acceptance/manager-image.iid && test ! -L /tmp/keaguard-m2-acceptance/manager-image.iid
+	bash hack/m2-docker-build-env.sh /tmp/keaguard-m2-acceptance /tmp/keaguard-m2-acceptance/docker-config /tmp/keaguard-m2-acceptance/docker-build-config -- $(CONTAINER_TOOL) build --platform=linux/amd64 --iidfile /tmp/keaguard-m2-acceptance/manager-image.iid -t ${IMG} .
+else
 	$(CONTAINER_TOOL) build --platform=linux/amd64 -t ${IMG} .
+endif
 
 ##@ Dependencies
 

@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"time"
 
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -29,6 +30,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	infrastructurev1alpha1 "github.com/trungnguyenuga/keaguard-operator/api/v1alpha1"
@@ -37,16 +39,28 @@ import (
 // KeaClusterReconciler reconciles a KeaCluster object
 type KeaClusterReconciler struct {
 	client.Client
-	APIReader           client.Reader
-	Scheme              *runtime.Scheme
-	Namespace           string
-	healthyRequeueAfter time.Duration
-	blockedRequeueAfter time.Duration
+	APIReader            client.Reader
+	Scheme               *runtime.Scheme
+	Namespace            string
+	healthyRequeueAfter  time.Duration
+	blockedRequeueAfter  time.Duration
+	progressRequeueAfter time.Duration
+}
+
+// actionResult separates resource action outcomes from the single status write
+// performed by the reconciliation boundary. Mutated means a request was
+// submitted, including one whose response was an error.
+type actionResult struct {
+	Mutated bool
+	Result  ctrl.Result
+	Err     error
 }
 
 // +kubebuilder:rbac:groups=infrastructure.keaguard.example,namespace=keaguard-system,resources=keaclusters,verbs=get;list;watch
 // +kubebuilder:rbac:groups=infrastructure.keaguard.example,namespace=keaguard-system,resources=keaclusters/status,verbs=patch
-// +kubebuilder:rbac:groups="",namespace=keaguard-system,resources=configmaps,verbs=get;list;watch;create;patch
+// +kubebuilder:rbac:groups="",namespace=keaguard-system,resources=configmaps;services,verbs=get;list;watch;create;patch;delete
+// +kubebuilder:rbac:groups=apps,namespace=keaguard-system,resources=statefulsets,verbs=get;list;watch;create;patch;delete
+// +kubebuilder:rbac:groups="",namespace=keaguard-system,resources=pods,verbs=get;list;watch
 
 // Reconcile observes one parent incarnation and submits at most one artifact write.
 func (r *KeaClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -63,13 +77,63 @@ func (r *KeaClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	if !origin.DeletionTimestamp.IsZero() {
 		return ctrl.Result{}, nil
 	}
+	names := namesFor(origin)
+	workload := r.observeWorkload(ctx, origin, names)
 	actual := &corev1.ConfigMap{}
 	err := r.APIReader.Get(ctx, req.NamespacedName, actual)
-	missing := apierrors.IsNotFound(err)
-	if err != nil && !missing {
-		return r.finishReconcile(ctx, origin, failedArtifactCondition(origin, "ObservationFailed"), ctrl.Result{}, err)
+	enabled, severity := effectiveWorkload(origin)
+	config, _ := generateKeaConfig(severity)
+	artifactCondition, identityAction := r.reconcileArtifact(ctx, origin, actual, err, enabled)
+	if artifactCondition.Type == "" {
+		return identityAction.Result, identityAction.Err
+	}
+	action := identityAction
+	if !enabled {
+		cleanupAction := r.reconcileDisabledWorkload(ctx, origin, names, &workload)
+		if cleanupAction.Mutated || cleanupAction.Result.RequeueAfter != 0 {
+			action = cleanupAction
+			action.Err = errors.Join(action.Err, identityAction.Err)
+		} else {
+			artifactCondition, identityAction = r.reconcileArtifact(ctx, origin, actual, err, true)
+			action = identityAction
+			action.Err = errors.Join(cleanupAction.Err, identityAction.Err)
+		}
+	} else {
+		action = identityAction
+		if enabled && artifactCondition.Status == metav1.ConditionTrue && !identityAction.Mutated && identityAction.Err == nil {
+			action = r.reconcileEnabledWorkload(ctx, origin, names, config, &workload)
+		}
+	}
+	if artifactCondition.Type == "" {
+		return action.Result, action.Err
+	}
+	if action.Err == nil {
+		action.Err = workloadObservationError(workload)
+	}
+	conditions := workloadConditions(origin, names, config, workload, artifactCondition)
+	result := action.Result
+	if !action.Mutated && action.Err == nil {
+		result = reconcileResult(workloadRequeue(append([]metav1.Condition{artifactCondition}, conditions...), r.progressRequeueAfter, r.blockedRequeueAfter, r.healthyRequeueAfter))
+	}
+	return r.finishConditions(ctx, origin, append([]metav1.Condition{artifactCondition}, conditions...), result, action.Err)
+}
+
+// reconcileArtifact observes and optionally repairs the identity artifact. It
+// never persists status; the caller owns the one batched status write.
+func (r *KeaClusterReconciler) reconcileArtifact(ctx context.Context, origin *infrastructurev1alpha1.KeaCluster, actual *corev1.ConfigMap, observationErr error, allowMutation bool) (metav1.Condition, actionResult) {
+	missing := apierrors.IsNotFound(observationErr)
+	mutated := false
+	if observationErr != nil && !missing {
+		return failedArtifactCondition(origin, "ObservationFailed"), actionResult{Err: observationErr}
 	}
 	if missing || observedArtifactCondition(origin, actual).Reason == "ArtifactOutOfSync" {
+		if !allowMutation {
+			condition := missingArtifactCondition(origin)
+			if !missing {
+				condition = observedArtifactCondition(origin, actual)
+			}
+			return condition, actionResult{Result: ctrl.Result{RequeueAfter: time.Second}}
+		}
 		base := actual
 		if missing {
 			actual = desiredArtifact(origin)
@@ -78,45 +142,54 @@ func (r *KeaClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 			setManagedFields(actual, desiredArtifact(origin))
 		}
 		fresh := &infrastructurev1alpha1.KeaCluster{}
-		if err := r.APIReader.Get(ctx, req.NamespacedName, fresh); err != nil {
+		if err := r.APIReader.Get(ctx, client.ObjectKeyFromObject(origin), fresh); err != nil {
 			if apierrors.IsNotFound(err) {
-				return ctrl.Result{}, nil
+				return metav1.Condition{}, actionResult{}
 			}
-			return r.finishReconcile(ctx, origin, failedArtifactCondition(origin, "ObservationFailed"), ctrl.Result{}, err)
+			return failedArtifactCondition(origin, "ObservationFailed"), actionResult{Err: err}
 		}
 		if !fresh.DeletionTimestamp.IsZero() {
-			return ctrl.Result{}, nil
+			return metav1.Condition{}, actionResult{}
 		}
 		if fresh.UID != origin.UID || fresh.Generation != origin.Generation {
-			return ctrl.Result{RequeueAfter: time.Second}, nil
+			return metav1.Condition{}, actionResult{Result: ctrl.Result{RequeueAfter: time.Second}}
 		}
 		if err := ctx.Err(); err != nil {
-			return ctrl.Result{}, err
+			return failedArtifactCondition(origin, "ObservationFailed"), actionResult{Err: err}
 		}
+		var writeErr error
 		if missing {
-			if err := r.Create(ctx, actual); err != nil {
-				return r.finishArtifactFailure(ctx, origin, err)
-			}
+			writeErr = r.Create(ctx, actual)
 		} else {
-			if err := r.Patch(ctx, actual, client.MergeFromWithOptions(base, client.MergeFromWithOptimisticLock{})); err != nil {
-				return r.finishArtifactFailure(ctx, origin, err)
-			}
+			writeErr = r.Patch(ctx, actual, client.MergeFromWithOptions(base, client.MergeFromWithOptimisticLock{}))
+		}
+		mutated = true
+		if writeErr != nil {
+			condition, observationErr := r.observeArtifactFailure(ctx, origin, writeErr)
+			return condition, actionResult{Mutated: true, Err: observationErr}
 		}
 	}
 
-	// Classify the returned object too: a successful write alone does not
-	// establish ownership, mutability, or matching managed state.
 	condition := observedArtifactCondition(origin, actual)
+	if mutated {
+		return condition, actionResult{Mutated: true, Result: ctrl.Result{RequeueAfter: time.Second}}
+	}
 	delay := r.blockedRequeueAfter
 	if condition.Status == metav1.ConditionTrue {
 		delay = r.healthyRequeueAfter
 	}
-	return r.finishReconcile(ctx, origin, condition, ctrl.Result{RequeueAfter: delay}, nil)
+	return condition, actionResult{Mutated: mutated, Result: ctrl.Result{RequeueAfter: delay}}
+}
+
+func missingArtifactCondition(parent *infrastructurev1alpha1.KeaCluster) metav1.Condition {
+	return metav1.Condition{Type: "ArtifactReconciled", Status: metav1.ConditionFalse, Reason: "ArtifactOutOfSync",
+		ObservedGeneration: parent.Generation, LastTransitionTime: metav1.Now(),
+		Message: fmt.Sprintf("ConfigMap %s/%s is missing; a later observation will create the identity artifact.", parent.Namespace, parent.Name)}
 }
 
 // Reobserve failed writes without retrying a mutation. An acknowledgement error
 // cannot establish failure; only explicit rejection plus observed drift can.
-func (r *KeaClusterReconciler) finishArtifactFailure(ctx context.Context, origin *infrastructurev1alpha1.KeaCluster, writeErr error) (ctrl.Result, error) {
+func (r *KeaClusterReconciler) observeArtifactFailure(ctx context.Context, origin *infrastructurev1alpha1.KeaCluster, writeErr error) (metav1.Condition, error) {
 	condition := failedArtifactCondition(origin, "MutationOutcomeUnknown")
 	if ctx.Err() == nil {
 		observed := &corev1.ConfigMap{}
@@ -140,7 +213,13 @@ func (r *KeaClusterReconciler) finishArtifactFailure(ctx context.Context, origin
 		}
 	}
 	logf.FromContext(ctx).Error(writeErr, "Artifact mutation returned an error; reporting latest observation", "reason", condition.Reason)
-	return r.finishReconcile(ctx, origin, condition, ctrl.Result{}, writeErr)
+	return condition, writeErr
+}
+
+// Compatibility wrapper retained for direct M1 status/recovery tests.
+func (r *KeaClusterReconciler) finishArtifactFailure(ctx context.Context, origin *infrastructurev1alpha1.KeaCluster, writeErr error) (ctrl.Result, error) {
+	condition, observedErr := r.observeArtifactFailure(ctx, origin, writeErr)
+	return r.finishReconcile(ctx, origin, condition, ctrl.Result{}, observedErr)
 }
 
 func failedArtifactCondition(parent *infrastructurev1alpha1.KeaCluster, reason string) metav1.Condition {
@@ -195,10 +274,42 @@ func (r *KeaClusterReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	if r.blockedRequeueAfter <= 0 {
 		r.blockedRequeueAfter = 30 * time.Second
 	}
+	if r.progressRequeueAfter <= 0 {
+		r.progressRequeueAfter = 5 * time.Second
+	}
 	return ctrl.NewControllerManagedBy(mgr).
 		WithOptions(controllerOptions()).
 		For(&infrastructurev1alpha1.KeaCluster{}, builder.WithPredicates(keaClusterPredicate())).
 		Owns(&corev1.ConfigMap{}, builder.WithPredicates(configMapPredicate())).
+		Owns(&corev1.Service{}, builder.WithPredicates(servicePredicate())).
+		Owns(&appsv1.StatefulSet{}, builder.WithPredicates(statefulSetPredicate())).
+		Watches(&corev1.Pod{}, handler.EnqueueRequestsFromMapFunc(r.mapPodToKeaCluster), builder.WithPredicates(podPredicate())).
 		Named("keacluster").
 		Complete(r)
+}
+
+// mapPodToKeaCluster trusts only the Kubernetes controller-owner chain. Pod
+// labels are mutable hints and never establish ownership.
+func (r *KeaClusterReconciler) mapPodToKeaCluster(ctx context.Context, object client.Object) []ctrl.Request {
+	pod, ok := object.(*corev1.Pod)
+	if !ok || pod == nil || pod.Namespace != r.Namespace {
+		return nil
+	}
+	statefulSetOwner := metav1.GetControllerOf(pod)
+	if statefulSetOwner == nil || statefulSetOwner.APIVersion != appsv1.SchemeGroupVersion.String() || statefulSetOwner.Kind != "StatefulSet" || statefulSetOwner.Name == "" || statefulSetOwner.UID == "" {
+		return nil
+	}
+	statefulSet := &appsv1.StatefulSet{}
+	if err := r.Get(ctx, client.ObjectKey{Namespace: pod.Namespace, Name: statefulSetOwner.Name}, statefulSet); err != nil || statefulSet.UID != statefulSetOwner.UID {
+		return nil
+	}
+	parentOwner := metav1.GetControllerOf(statefulSet)
+	if parentOwner == nil || parentOwner.APIVersion != infrastructurev1alpha1.GroupVersion.String() || parentOwner.Kind != "KeaCluster" || parentOwner.Name == "" || parentOwner.UID == "" {
+		return nil
+	}
+	parent := &infrastructurev1alpha1.KeaCluster{}
+	if err := r.Get(ctx, client.ObjectKey{Namespace: statefulSet.Namespace, Name: parentOwner.Name}, parent); err != nil || parent.UID != parentOwner.UID {
+		return nil
+	}
+	return []ctrl.Request{{NamespacedName: client.ObjectKey{Namespace: statefulSet.Namespace, Name: parentOwner.Name}}}
 }

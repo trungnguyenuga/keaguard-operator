@@ -19,18 +19,32 @@ import (
 // withArtifactCondition records artifact evidence without changing the observation's input.
 // The caller supplies the attempted generation and observation time.
 func withArtifactCondition(current infrastructurev1alpha1.KeaClusterStatus, condition metav1.Condition) (infrastructurev1alpha1.KeaClusterStatus, bool) {
+	return withConditions(current, condition)
+}
+
+// withConditions applies a complete observation batch to a copy of the status.
+// metav1's condition helper preserves transition times when status is unchanged.
+func withConditions(current infrastructurev1alpha1.KeaClusterStatus, conditions ...metav1.Condition) (infrastructurev1alpha1.KeaClusterStatus, bool) {
 	next := current.DeepCopy()
-	meta.SetStatusCondition(&next.Conditions, condition)
-	next.ObservedGeneration = condition.ObservedGeneration
+	for _, condition := range conditions {
+		meta.SetStatusCondition(&next.Conditions, condition)
+		next.ObservedGeneration = condition.ObservedGeneration
+	}
 	return *next, !equality.Semantic.DeepEqual(current, *next)
 }
 
 // finishReconcile persists only an eligible observation. It never mutates an artifact
 // or retries a stale result, and reporting cannot consume a recoverable operation error.
 func (r *KeaClusterReconciler) finishReconcile(ctx context.Context, origin *infrastructurev1alpha1.KeaCluster, condition metav1.Condition, result ctrl.Result, reconcileErr error) (ctrl.Result, error) {
+	return r.finishConditions(ctx, origin, []metav1.Condition{condition}, result, reconcileErr)
+}
+
+// finishConditions persists a complete observation batch with one optimistic
+// status patch, after validating the originating parent incarnation.
+func (r *KeaClusterReconciler) finishConditions(ctx context.Context, origin *infrastructurev1alpha1.KeaCluster, conditions []metav1.Condition, result ctrl.Result, reconcileErr error) (ctrl.Result, error) {
 	statusFailure := func(err error) (ctrl.Result, error) {
-		wrapped := fmt.Errorf("persist artifact observation for KeaCluster %s/%s: %w", origin.Namespace, origin.Name, err)
-		logf.FromContext(ctx).Error(wrapped, "Current artifact status could not be persisted; observation may be unresolved")
+		wrapped := fmt.Errorf("persist observations for KeaCluster %s/%s: %w", origin.Namespace, origin.Name, err)
+		logf.FromContext(ctx).Error(wrapped, "Current status could not be persisted; observation may be unresolved")
 		return ctrl.Result{}, errors.Join(reconcileErr, wrapped)
 	}
 	finish := func(result ctrl.Result) (ctrl.Result, error) {
@@ -42,7 +56,7 @@ func (r *KeaClusterReconciler) finishReconcile(ctx context.Context, origin *infr
 	if err := ctx.Err(); err != nil {
 		return statusFailure(err)
 	}
-	if _, changed := withArtifactCondition(origin.Status, condition); !changed {
+	if _, changed := withConditions(origin.Status, conditions...); !changed {
 		return finish(result)
 	}
 
@@ -59,7 +73,7 @@ func (r *KeaClusterReconciler) finishReconcile(ctx context.Context, origin *infr
 	if fresh.UID != origin.UID || fresh.Generation != origin.Generation {
 		return finish(ctrl.Result{RequeueAfter: time.Second})
 	}
-	next, changed := withArtifactCondition(fresh.Status, condition)
+	next, changed := withConditions(fresh.Status, conditions...)
 	if !changed {
 		return finish(result)
 	}

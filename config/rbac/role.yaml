@@ -9,8 +9,29 @@ rules:
   - ""
   resources:
   - configmaps
+  - services
   verbs:
   - create
+  - delete
+  - get
+  - list
+  - patch
+  - watch
+- apiGroups:
+  - ""
+  resources:
+  - pods
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - apps
+  resources:
+  - statefulsets
+  verbs:
+  - create
+  - delete
   - get
   - list
   - patch

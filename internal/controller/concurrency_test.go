@@ -57,7 +57,7 @@ var _ = Describe("ENV: Creation race", func() {
 				Expect(next.otherWrites()).To(Equal(1))
 				Expect(got.Data["keacluster-uid"]).To(Equal(string(p.UID)))
 				Expect(got.Data).To(HaveLen(3))
-				Expect(result.RequeueAfter).To(Equal(5 * time.Minute))
+				Expect(result.RequeueAfter).To(Equal(time.Second))
 			} else {
 				Expect(next.otherWrites()).To(BeZero())
 				Expect(got).To(Equal(competitor))

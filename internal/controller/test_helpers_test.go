@@ -5,11 +5,13 @@ import (
 	"errors"
 	"fmt"
 	corev1 "k8s.io/api/core/v1"
+	"reflect"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/config"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -32,6 +34,52 @@ type statusRecordingClient struct {
 	resourceWrites int
 	patchErr       error
 	beforePatch    func(context.Context, client.Object, client.Patch) error
+	operations     []apiOperation
+}
+
+type apiOperation struct {
+	Verb, Kind, Namespace, Name, Error string
+}
+
+func operationKind(obj any) string {
+	t := reflect.TypeOf(obj)
+	if t == nil {
+		return "unknown"
+	}
+	for t.Kind() == reflect.Pointer {
+		t = t.Elem()
+	}
+	return strings.TrimSuffix(t.Name(), "List")
+}
+
+func (c *statusRecordingClient) recordOperation(verb string, obj any, err error) {
+	record := apiOperation{Verb: verb, Kind: operationKind(obj)}
+	if object, ok := obj.(client.Object); ok && object != nil {
+		record.Namespace, record.Name = object.GetNamespace(), object.GetName()
+	}
+	if err != nil {
+		record.Error = err.Error()
+	}
+	c.mu.Lock()
+	c.operations = append(c.operations, record)
+	c.mu.Unlock()
+}
+
+func (c *statusRecordingClient) operationSnapshot() []apiOperation {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]apiOperation(nil), c.operations...)
+}
+
+func (c *statusRecordingClient) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+	err := c.Client.Get(ctx, key, obj, opts...)
+	c.recordOperation("get", obj, err)
+	return err
+}
+func (c *statusRecordingClient) List(ctx context.Context, list client.ObjectList, opts ...client.ListOption) error {
+	err := c.Client.List(ctx, list, opts...)
+	c.recordOperation("list", list, err)
+	return err
 }
 
 func (c *statusRecordingClient) statusPatches() int {
@@ -53,15 +101,18 @@ func (w *statusRecordingWriter) Patch(ctx context.Context, obj client.Object, pa
 	c.mu.Lock()
 	c.patches++
 	c.mu.Unlock()
+	var err error
 	if c.beforePatch != nil {
-		if err := c.beforePatch(ctx, obj, patch); err != nil {
-			return err
-		}
+		err = c.beforePatch(ctx, obj, patch)
 	}
-	if c.patchErr != nil {
-		return c.patchErr
+	if err == nil && c.patchErr != nil {
+		err = c.patchErr
 	}
-	return w.SubResourceWriter.Patch(ctx, obj, patch, opts...)
+	if err == nil {
+		err = w.SubResourceWriter.Patch(ctx, obj, patch, opts...)
+	}
+	c.recordOperation("status-patch", obj, err)
+	return err
 }
 
 type statusReader struct {
@@ -88,23 +139,33 @@ func (c *statusRecordingClient) otherWrites() int {
 func (c *statusRecordingClient) recordResourceWrite() { c.mu.Lock(); c.resourceWrites++; c.mu.Unlock() }
 func (c *statusRecordingClient) Create(ctx context.Context, obj client.Object, opts ...client.CreateOption) error {
 	c.recordResourceWrite()
-	return c.Client.Create(ctx, obj, opts...)
+	err := c.Client.Create(ctx, obj, opts...)
+	c.recordOperation("create", obj, err)
+	return err
 }
 func (c *statusRecordingClient) Patch(ctx context.Context, obj client.Object, p client.Patch, opts ...client.PatchOption) error {
 	c.recordResourceWrite()
-	return c.Client.Patch(ctx, obj, p, opts...)
+	err := c.Client.Patch(ctx, obj, p, opts...)
+	c.recordOperation("patch", obj, err)
+	return err
 }
 func (c *statusRecordingClient) Update(ctx context.Context, obj client.Object, opts ...client.UpdateOption) error {
 	c.recordResourceWrite()
-	return c.Client.Update(ctx, obj, opts...)
+	err := c.Client.Update(ctx, obj, opts...)
+	c.recordOperation("update", obj, err)
+	return err
 }
 func (c *statusRecordingClient) Delete(ctx context.Context, obj client.Object, opts ...client.DeleteOption) error {
 	c.recordResourceWrite()
-	return c.Client.Delete(ctx, obj, opts...)
+	err := c.Client.Delete(ctx, obj, opts...)
+	c.recordOperation("delete", obj, err)
+	return err
 }
 func (c *statusRecordingClient) DeleteAllOf(ctx context.Context, obj client.Object, opts ...client.DeleteAllOfOption) error {
 	c.recordResourceWrite()
-	return c.Client.DeleteAllOf(ctx, obj, opts...)
+	err := c.Client.DeleteAllOf(ctx, obj, opts...)
+	c.recordOperation("delete-all-of", obj, err)
+	return err
 }
 func (w *statusRecordingWriter) Update(ctx context.Context, obj client.Object, opts ...client.SubResourceUpdateOption) error {
 	w.recorder.mu.Lock()
@@ -124,19 +185,33 @@ func (w *statusRecordingWriter) Create(ctx context.Context, obj client.Object, s
 type coreRecordingReader struct {
 	client.Reader
 	parents, children int
+	lists             int
 	parentGet         func(*infrastructurev1alpha1.KeaCluster) error
+	operations        []apiOperation
+}
+
+func (r *coreRecordingReader) recordOperation(verb string, key client.ObjectKey, obj any, err error) {
+	record := apiOperation{Verb: verb, Kind: operationKind(obj), Namespace: key.Namespace, Name: key.Name}
+	if err != nil {
+		record.Error = err.Error()
+	}
+	r.operations = append(r.operations, record)
 }
 
 func (r *coreRecordingReader) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
 	if p, ok := obj.(*infrastructurev1alpha1.KeaCluster); ok {
 		r.parents++
 		if r.parentGet != nil {
-			return r.parentGet(p)
+			err := r.parentGet(p)
+			r.recordOperation("get", key, obj, err)
+			return err
 		}
 	} else {
 		r.children++
 	}
-	return r.Reader.Get(ctx, key, obj, opts...)
+	err := r.Reader.Get(ctx, key, obj, opts...)
+	r.recordOperation("get", key, obj, err)
+	return err
 }
 
 type coreRecordingClient struct {
@@ -146,11 +221,15 @@ type coreRecordingClient struct {
 
 func (c *coreRecordingClient) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
 	c.calls++
-	return c.Client.Get(ctx, key, obj, opts...)
+	err := c.Client.Get(ctx, key, obj, opts...)
+	c.recordOperation("get", obj, err)
+	return err
 }
 func (c *coreRecordingClient) List(ctx context.Context, obj client.ObjectList, opts ...client.ListOption) error {
 	c.calls++
-	return c.Client.List(ctx, obj, opts...)
+	err := c.Client.List(ctx, obj, opts...)
+	c.recordOperation("list", obj, err)
+	return err
 }
 func (c *coreRecordingClient) Status() client.SubResourceWriter {
 	c.calls++
@@ -163,8 +242,10 @@ func (c *coreRecordingClient) Create(ctx context.Context, obj client.Object, opt
 }
 
 func (r *coreRecordingReader) List(ctx context.Context, obj client.ObjectList, opts ...client.ListOption) error {
-	r.children++
-	return r.Reader.List(ctx, obj, opts...)
+	r.lists++
+	err := r.Reader.List(ctx, obj, opts...)
+	r.recordOperation("list", client.ObjectKey{}, obj, err)
+	return err
 }
 
 // One-shot barriers bound both the fixture and controller waits. Callbacks run
@@ -196,6 +277,7 @@ type barrierClient struct {
 	*statusRecordingClient
 	beforeCreate func(context.Context) error
 	beforePatch  func(context.Context) error
+	beforeDelete func(context.Context) error
 }
 
 func (c *barrierClient) Create(ctx context.Context, obj client.Object, opts ...client.CreateOption) error {
@@ -213,6 +295,14 @@ func (c *barrierClient) Patch(ctx context.Context, obj client.Object, p client.P
 		}
 	}
 	return c.statusRecordingClient.Patch(ctx, obj, p, opts...)
+}
+func (c *barrierClient) Delete(ctx context.Context, obj client.Object, opts ...client.DeleteOption) error {
+	if c.beforeDelete != nil {
+		if err := c.beforeDelete(ctx); err != nil {
+			return err
+		}
+	}
+	return c.statusRecordingClient.Delete(ctx, obj, opts...)
 }
 
 type barrierReader struct {
@@ -278,10 +368,19 @@ type managerFaultKey struct{}
 
 type managerRecordingClient struct {
 	*statusRecordingClient
-	requests     atomic.Int64
-	observations atomic.Int64
-	attempts     atomic.Int64
-	stage        atomic.Pointer[string]
+	requests            atomic.Int64
+	observations        atomic.Int64
+	attempts            atomic.Int64
+	stage               atomic.Pointer[string]
+	committedCreateUsed atomic.Bool
+	requestMu           sync.Mutex
+	requestKeys         []client.ObjectKey
+}
+
+func (c *managerRecordingClient) requestSnapshot() []client.ObjectKey {
+	c.requestMu.Lock()
+	defer c.requestMu.Unlock()
+	return append([]client.ObjectKey(nil), c.requestKeys...)
 }
 
 func (c *managerRecordingClient) fault(stage string) bool {
@@ -293,30 +392,51 @@ func (c *managerRecordingClient) fault(stage string) bool {
 	return false
 }
 func (c *managerRecordingClient) Get(ctx context.Context, k client.ObjectKey, o client.Object, opts ...client.GetOption) error {
+	var err error
 	if _, ok := o.(*infrastructurev1alpha1.KeaCluster); ok {
 		c.requests.Add(1)
+		c.requestMu.Lock()
+		c.requestKeys = append(c.requestKeys, k)
+		c.requestMu.Unlock()
 		if c.fault("read") {
-			return fmt.Errorf("modelled temporary parent read failure")
+			err = fmt.Errorf("modelled temporary parent read failure")
+			c.recordOperation("get", o, err)
+			return err
 		}
 	}
-	return c.Client.Get(ctx, k, o, opts...)
+	err = c.Client.Get(ctx, k, o, opts...)
+	c.recordOperation("get", o, err)
+	return err
 }
 func (c *managerRecordingClient) Create(ctx context.Context, o client.Object, opts ...client.CreateOption) error {
+	if stage := c.stage.Load(); stage != nil && *stage == "create-committed" && c.committedCreateUsed.CompareAndSwap(false, true) {
+		c.attempts.Add(1)
+		if err := c.statusRecordingClient.Create(ctx, o, opts...); err != nil {
+			return err
+		}
+		err := fmt.Errorf("modelled committed create with lost acknowledgement")
+		c.recordOperation("create-lost-response", o, err)
+		return err
+	}
 	if c.fault("create") {
 		c.recordResourceWrite()
-		return fmt.Errorf("modelled uncertain create rejection")
+		err := fmt.Errorf("modelled uncertain create rejection")
+		c.recordOperation("create", o, err)
+		return err
 	}
 	return c.statusRecordingClient.Create(ctx, o, opts...)
 }
 func (c *managerRecordingClient) Patch(ctx context.Context, o client.Object, p client.Patch, opts ...client.PatchOption) error {
 	if c.fault("patch") {
 		c.recordResourceWrite()
-		return fmt.Errorf("modelled uncertain patch rejection")
+		err := fmt.Errorf("modelled uncertain patch rejection")
+		c.recordOperation("patch", o, err)
+		return err
 	}
 	return c.statusRecordingClient.Patch(ctx, o, p, opts...)
 }
 
-func startTestManager(parent context.Context, namespace string, healthy, blocked time.Duration, suppressChildEvents bool) (mgr ctrl.Manager, reconciler *KeaClusterReconciler, stop func() error, err error) {
+func startTestManager(parent context.Context, namespace, identityName string, healthy, blocked time.Duration, suppressChildEvents bool, progress ...time.Duration) (mgr ctrl.Manager, reconciler *KeaClusterReconciler, stop func() error, err error) {
 	managerCtx, cancelManager := context.WithCancel(parent)
 	skip := true // Repeated controllers in this test process share the production name.
 	mgr, err = ctrl.NewManager(cfg, ctrl.Options{Scheme: testScheme,
@@ -337,8 +457,9 @@ func startTestManager(parent context.Context, namespace string, healthy, blocked
 		}
 		return nil
 	}
-	reconciler = newTestReconciler(c, &recoveryReader{Reader: mgr.GetAPIReader(), read: func(_ context.Context, o client.Object) error {
-		if _, ok := o.(*corev1.ConfigMap); ok {
+	identityKey := client.ObjectKey{Namespace: namespace, Name: identityName}
+	reconciler = newTestReconciler(c, &recoveryReader{Reader: mgr.GetAPIReader(), readAt: func(_ context.Context, key client.ObjectKey, o client.Object) error {
+		if _, ok := o.(*corev1.ConfigMap); ok && key == identityKey {
 			c.observations.Add(1)
 			if c.fault("child") {
 				return fmt.Errorf("modelled child observation failure")
@@ -348,6 +469,9 @@ func startTestManager(parent context.Context, namespace string, healthy, blocked
 	}}, namespace)
 	reconciler.healthyRequeueAfter = healthy
 	reconciler.blockedRequeueAfter = blocked
+	if len(progress) > 0 {
+		reconciler.progressRequeueAfter = progress[0]
+	}
 	if suppressChildEvents {
 		// This sole alternative intentionally omits child delivery, keeping all other
 		// production predicates/options/reconciliation unchanged.
