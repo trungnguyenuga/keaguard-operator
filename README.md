@@ -1,9 +1,9 @@
 # KeaGuard
 
-KeaGuard M1 is a Kubernetes controller foundation for reconciling a namespaced `KeaCluster` resource into an internal ConfigMap artifact. Its `spec` is intentionally empty. The ConfigMap records the parent name, namespace, and UID; it is not Kea configuration.
+KeaGuard is a Kubernetes Operator written in Go for managing ISC Kea workloads through a namespaced `KeaCluster` resource. The project is currently in M2, focused on deploying and managing Kea processes in a controlled local environment.
 
-`ArtifactReconciled` reports whether that internal artifact matches the controller's ownership and managed-field contract. It does not report Kea process health, DHCP service, lease synchronization, or failover readiness. M1 does not deploy or configure Kea and makes no DHCP, HA, availability, latency, or performance claims.
+With `spec.workload.enabled: true`, the operator manages a two-replica StatefulSet, a generated configuration ConfigMap, and a headless Service. Each replica runs separate DHCPv4 and DHCPv6 containers using pinned ISC Kea images, process health probes, and ephemeral runtime storage. The operator also maintains an internal identity ConfigMap for each `KeaCluster`.
 
-See [M1 development and local acceptance](docs/development/m1.md) for pinned tools, separate CRD/runtime installation, tests, safe opt-in Kind selection, and the limits of the current milestone.
+M2 demonstrates process management only. The generated Kea configurations have no DHCP listeners, subnets, or address pools. The two replicas operate independently; lease synchronization, Kea HA, and DHCP failover are outside this milestone. `ArtifactReconciled` describes the identity artifact, while `WorkloadReady` reports workload readiness under the process-only contract. Neither condition establishes DHCP service availability.
 
-The fixed Kea process workload is a separate opt-in profile with distinct image, namespace-policy, and runtime requirements. See [M2 development and local acceptance](docs/development/m2.md) before preparing its dedicated disposable Kind lab. The default M1 sample remains disabled by default; the enabled M2 sample is intentionally excluded from the default sample bundle.
+The workload is disabled by default. The [enabled M2 sample](config/samples/infrastructure_v1alpha1_keacluster_m2.yaml) is intentionally excluded from the default sample bundle. Read [M2 development and local acceptance](docs/development/m2.md) for pinned tools and images, namespace-policy requirements, verification commands, and dedicated disposable Kind lab setup before enabling it.
